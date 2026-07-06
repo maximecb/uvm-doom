@@ -7,13 +7,18 @@
 # for DEMO2 and 8550 for DEMO3), so it gives the most stable timing sample.
 #
 # -timedemo replays the demo as fast as possible (DOOM's singletics mode, no
-# frame pacing) and, on completion, prints a line of the form:
+# frame pacing) with no window, exercising the full per-frame pipeline: game
+# logic, DOOM's software renderer, and our 3x nearest-neighbor upscale/byte-swap
+# (vm_present_frame). Only the window blit and audio are skipped. On completion
+# it prints two lines:
 #
 #   Error: timed <gametics> gametics in <realtics> realtics
+#   [uvm-doom] benchmark: <frames> frames in <ms> ms = <fps> fps
 #
-# where realtics are 1/35s units, so the average frame rate is
-# gametics * 35 / realtics. ("Error:" is just how DOOM reports the result; it
-# is not a failure.)
+# The first is DOOM's own report (realtics are 1/35s units; "Error:" is just how
+# DOOM prints it, not a failure). The second is a wall-clock frames/sec figure
+# measured over the whole run. Expect this to take a couple of minutes: on the
+# interpreted VM the upscale dominates, so the frame rate is modest.
 set -e
 
 cd "$(dirname "$0")"

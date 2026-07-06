@@ -53,6 +53,11 @@ static uint32_t g_win_pixels[WIN_HEIGHT * WIN_WIDTH];
 
 static int g_quit = 0; // Set when the user closes the window or DOOM asks to quit
 
+// Set when running a -timedemo benchmark. In this mode there is no window, so
+// vm_present_frame() still does the upscale/byte-swap work (so it's measured)
+// but skips the final window_draw_frame blit.
+static int g_benchmark = 0;
+
 // Last absolute mouse position, used to derive relative motion for look
 // controls. -1 means "no previous position yet".
 static int g_last_mouse_x = -1;
@@ -278,7 +283,10 @@ void vm_present_frame(const unsigned char* framebuffer, int width, int height)
         }
     }
 
-    window_draw_frame(g_window_id, (const uint8_t*)g_win_pixels);
+    // In benchmark mode there is no window; we still ran the upscale above so
+    // it's included in the timing, but there is nothing to blit to.
+    if (!g_benchmark)
+        window_draw_frame(g_window_id, (const uint8_t*)g_win_pixels);
 }
 
 //-----------------------------------------------------------------------------
@@ -406,9 +414,13 @@ int main(int argc, char** argv)
 {
     int doom_argc = build_doom_argv(argc, argv);
     int benchmark = (g_timedemo_name != NULL);
+    g_benchmark = benchmark; // visible to vm_present_frame()
 
-    // Bring up the window. It stays hidden until the first frame is drawn.
-    g_window_id = window_create(WIN_WIDTH, WIN_HEIGHT, "PureDOOM - UVM", 0);
+    // Bring up the window. It stays hidden until the first frame is drawn. In
+    // benchmark mode we never draw, so skip the window entirely (see the main
+    // loop for why presenting/polling is skipped when benchmarking).
+    if (!benchmark)
+        g_window_id = window_create(WIN_WIDTH, WIN_HEIGHT, "PureDOOM - UVM", 0);
 
     // Wire up DOOM's platform callbacks.
     doom_set_exit(doom_exit_override);
@@ -422,10 +434,21 @@ int main(int argc, char** argv)
 
     // Kick off the benchmark demo. G_TimeDemo() sets timingdemo so that, when
     // the demo finishes, DOOM prints "timed <gametics> in <realtics> realtics"
-    // and quits (via our exit override). It overrides the attract-mode loop
-    // that doom_init() just started. We drive it below with doom_force_update().
+    // and quits (via our exit override). We drive it below with
+    // doom_force_update().
+    //
+    // doom_init() already started the attract loop (D_StartTitle), which leaves
+    // advancedemo=true — a pending request to cycle the title/demo sequence. If
+    // we don't clear it, the first D_DoomLoop tic runs D_DoAdvanceDemo() before
+    // G_Ticker acts on our ga_playdemo, resetting gameaction and replaying the
+    // demos through the attract path (normal speed, no timingdemo, looping
+    // forever). Clearing it lets our timed demo run instead.
     if (benchmark)
+    {
+        extern doom_boolean advancedemo;
         G_TimeDemo(g_timedemo_name);
+        advancedemo = false;
+    }
 
     // Only now that DOOM is initialized is it safe for the audio thread to call
     // into it. Open the mono 44100Hz output, which spawns the audio callback
@@ -441,23 +464,37 @@ int main(int argc, char** argv)
     // DOOM's native 35Hz tic rate.
     const uint64_t frame_ms = 1000 / 60;
 
+    // Benchmark timing: wall-clock start and frame count, used for the FPS
+    // report printed after the loop.
+    uint64_t bench_start_ms = time_current_ms();
+    uint64_t bench_frames = 0;
+
     while (!g_quit)
     {
-        uint64_t start = time_current_ms();
-
-        vm_poll_input();
-
         if (benchmark)
         {
             // Benchmark: run one gametic per iteration as fast as possible.
             // doom_force_update() ignores doom_update()'s real-time throttle,
-            // so the demo plays back flat-out. No audio thread runs here, so no
-            // lock is needed. When the demo ends DOOM sets g_quit via I_Error/
-            // our exit override, breaking the loop.
+            // so the demo plays back flat-out. When the demo ends DOOM sets
+            // g_quit (via I_Error/our exit override), breaking the loop.
+            //
+            // We still call vm_present_frame() so the upscale / byte-swap path
+            // is exercised and counted, but with no window it skips the final
+            // blit (see vm_present_frame). We deliberately do NOT poll input:
+            // vm_poll_input() would feed window events to DOOM, and any input
+            // during demo playback pops up the menu (G_Responder), aborting the
+            // demo back into the attract loop instead of hitting the timingdemo
+            // exit -- so it would "start over" forever rather than reporting a
+            // result.
             doom_force_update();
             vm_present_frame(doom_get_framebuffer(4), WIDTH, HEIGHT);
+            bench_frames++;
             continue;
         }
+
+        uint64_t start = time_current_ms();
+
+        vm_poll_input();
 
         // The audio thread also calls into DOOM's sound code; hold the lock
         // around doom_update() so the two never run concurrently.
@@ -471,6 +508,33 @@ int main(int argc, char** argv)
         uint64_t elapsed = time_current_ms() - start;
         if (elapsed < frame_ms)
             thread_sleep(frame_ms - elapsed);
+    }
+
+    // Report the benchmark result: DOOM already printed its "timed N gametics
+    // in M realtics" line from I_Error; add a wall-clock frames/sec figure
+    // measured over the whole run (game logic + render + upscale).
+    if (benchmark)
+    {
+        uint64_t elapsed_ms = time_current_ms() - bench_start_ms;
+        if (elapsed_ms == 0) elapsed_ms = 1; // avoid divide-by-zero
+
+        // fps to two decimals via integer math (fps * 100).
+        uint64_t fps100 = (bench_frames * 100000) / elapsed_ms;
+
+        print_str("\n[uvm-doom] benchmark: ");
+        print_str(doom_itoa((int)bench_frames, 10));
+        print_str(" frames in ");
+        print_str(doom_itoa((int)elapsed_ms, 10));
+        print_str(" ms = ");
+        print_str(doom_itoa((int)(fps100 / 100), 10));
+        print_str(".");
+        // Zero-pad the fractional part to two digits.
+        {
+            int frac = (int)(fps100 % 100);
+            if (frac < 10) print_str("0");
+            print_str(doom_itoa(frac, 10));
+        }
+        print_str(" fps\n");
     }
 
     return 0;
