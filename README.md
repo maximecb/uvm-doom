@@ -1,5 +1,10 @@
 # uvm-doom
+
 UVM port of Doom
+
+<p align="center">
+  <img src="uvm_doom.jpg" width="600" />
+</p>
 
 ## Getting the code
 
