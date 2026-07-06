@@ -360,14 +360,52 @@ void setup_midi(void) {}
 //       send_midi_msg((uint32_t)midi_msg);
 #endif
 
-int main(void)
+// When non-NULL, the name of a demo lump to benchmark under -timedemo (set by
+// build_doom_argv). Points into the argv the VM handed us, which lives for the
+// whole run, so DOOM can keep the pointer.
+static char* g_timedemo_name = NULL;
+
+// DOOM's argv, filtered from our own argv in build_doom_argv().
+#define MAX_DOOM_ARGS 32
+static char* doom_argv[MAX_DOOM_ARGS];
+
+// Build DOOM's argv from our command-line arguments. argv[0] is the .asm
+// program path (the usual argv[0] convention); DOOM only scans argv from index
+// 1, so we forward "doom" as argv[0] and pass the rest through.
+//
+// `-timedemo <name>` is intercepted here rather than forwarded: PureDOOM's
+// command-line handler for it is broken (it calls D_DoomLoop() expecting an
+// infinite loop, but PureDOOM made D_DoomLoop run a single tic, so it falls
+// through to D_StartTitle() and drops into the attract loop). We record the
+// demo name instead and drive the timedemo ourselves after doom_init().
+//
+// Returns the number of entries written to doom_argv.
+static int build_doom_argv(int argc, char** argv)
 {
-    // uvclang's entry stub calls main with no arguments (`call main, 0`), so
-    // main must not take argc/argv — reading them traps the VM with
-    // "invalid index in get_arg, argc=0". UVM has no command line to forward to
-    // DOOM anyway, so init it with a lone program-name argument; DOOM only
-    // scans argv from index 1, so nothing past argv[0] is touched.
-    static char* doom_argv[] = { "doom" };
+    doom_argv[0] = "doom";
+    int n = 1;
+
+    for (int i = 1; i < argc && n < MAX_DOOM_ARGS; ++i)
+    {
+        // Intercept `-timedemo <name>`: capture the operand and don't forward
+        // either token to DOOM (see the note above).
+        if (strcmp(argv[i], "-timedemo") == 0 && i + 1 < argc)
+        {
+            g_timedemo_name = argv[i + 1];
+            ++i; // also skip the demo-name operand
+            continue;
+        }
+
+        doom_argv[n++] = argv[i];
+    }
+
+    return n;
+}
+
+int main(int argc, char** argv)
+{
+    int doom_argc = build_doom_argv(argc, argv);
+    int benchmark = (g_timedemo_name != NULL);
 
     // Bring up the window. It stays hidden until the first frame is drawn.
     g_window_id = window_create(WIN_WIDTH, WIN_HEIGHT, "PureDOOM - UVM", 0);
@@ -380,13 +418,24 @@ int main(void)
     doom_set_gettime(vm_gettime);
 
     doom_set_resolution(WIDTH, HEIGHT);
-    doom_init(1, doom_argv, DOOM_FLAG_MENU_DARKEN_BG);
+    doom_init(doom_argc, doom_argv, DOOM_FLAG_MENU_DARKEN_BG);
+
+    // Kick off the benchmark demo. G_TimeDemo() sets timingdemo so that, when
+    // the demo finishes, DOOM prints "timed <gametics> in <realtics> realtics"
+    // and quits (via our exit override). It overrides the attract-mode loop
+    // that doom_init() just started. We drive it below with doom_force_update().
+    if (benchmark)
+        G_TimeDemo(g_timedemo_name);
 
     // Only now that DOOM is initialized is it safe for the audio thread to call
     // into it. Open the mono 44100Hz output, which spawns the audio callback
-    // thread. (Music/MIDI is disabled; see the block above.)
-    g_audio_ready = 1;
-    audio_open_output(44100, 1, AUDIO_FORMAT_I16, (void*)audio_cb);
+    // thread. (Music/MIDI is disabled; see the block above.) Skip audio when
+    // benchmarking so the audio thread's lock contention doesn't skew timings.
+    if (!benchmark)
+    {
+        g_audio_ready = 1;
+        audio_open_output(44100, 1, AUDIO_FORMAT_I16, (void*)audio_cb);
+    }
 
     // Target ~60 FPS. doom_update() additionally self-throttles game logic to
     // DOOM's native 35Hz tic rate.
@@ -398,6 +447,18 @@ int main(void)
 
         vm_poll_input();
 
+        if (benchmark)
+        {
+            // Benchmark: run one gametic per iteration as fast as possible.
+            // doom_force_update() ignores doom_update()'s real-time throttle,
+            // so the demo plays back flat-out. No audio thread runs here, so no
+            // lock is needed. When the demo ends DOOM sets g_quit via I_Error/
+            // our exit override, breaking the loop.
+            doom_force_update();
+            vm_present_frame(doom_get_framebuffer(4), WIDTH, HEIGHT);
+            continue;
+        }
+
         // The audio thread also calls into DOOM's sound code; hold the lock
         // around doom_update() so the two never run concurrently.
         pthread_mutex_lock(&g_doom_lock);
@@ -406,6 +467,7 @@ int main(void)
 
         vm_present_frame(doom_get_framebuffer(4), WIDTH, HEIGHT);
 
+        // Cap to ~60 FPS in normal play.
         uint64_t elapsed = time_current_ms() - start;
         if (elapsed < frame_ms)
             thread_sleep(frame_ms - elapsed);
