@@ -15808,6 +15808,15 @@ int I_GetSfxLumpNum(sfxinfo_t* sfx)
 //
 int I_StartSound(int id, int vol, int sep, int pitch, int priority)
 {
+    // [UVM] The game passes vol in 0..15 (snd_SfxVolume units), but addsfx's
+    // volume math and vol_lookup tables are built for 0..127 (the original
+    // engine passed snd_SfxVolume * 8 -- see the "/* *8 */" comment at the
+    // S_Init call site). Without this, every SFX mixes at ~1/8 of its
+    // intended amplitude.
+    vol *= 8;
+    if (vol > 127)
+        vol = 127;
+
     // Returns a handle (not used).
     id = addsfx(id, vol, steptable[pitch], sep);
     return id;

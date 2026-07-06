@@ -8,8 +8,8 @@
 // or any other host-OS dependency here.
 //
 // Known limitations of the UVM backend (see the notes at each call site):
-//   - Music is disabled: UVM has no MIDI synthesizer primitive, so the MIDI
-//     code from the original SDL port is commented out below.
+//   - Music: UVM has no MIDI synthesizer primitive, so DOOM's MIDI stream is
+//     rendered by our own small GM software synth (see synth.c).
 //   - UVM audio output is 44100Hz, i16 only, so DOOM's 11025Hz stereo mix is
 //     upsampled 4x (keeping left/right separation) in the audio callback.
 //   - UVM has no relative-mouse / pointer-lock mode, so mouse look is derived
@@ -303,6 +303,27 @@ void vm_present_frame(const unsigned char* indexed, int width, int height)
 }
 
 //-----------------------------------------------------------------------------
+// Music (MIDI): rendered by our own GM software synthesizer (synth.c).
+//
+// The original SDL port forwarded DOOM's MIDI stream to a platform synth
+// (CoreAudio's DLS synth on macOS). UVM has no MIDI synthesizer primitive,
+// so we synthesize the music ourselves: doom_tick_midi() is drained at
+// DOOM's 140Hz MIDI rate from the audio callback (sample-accurately
+// interleaved with rendering), and synth.c turns the messages into audio
+// that is additively mixed over the SFX.
+//
+// synth.c is #included rather than compiled separately because the build
+// hands uvclang a single translation unit (main.c), mirroring how PureDOOM.h
+// itself is included.
+//-----------------------------------------------------------------------------
+#include "synth.c"
+
+// Frames between 140Hz MIDI pumps (44100 / 140 == 315 exactly), and the
+// count of frames left until the next pump. Only touched on the audio thread.
+#define MIDI_PUMP_FRAMES (44100 / DOOM_MIDI_RATE)
+static int g_midi_countdown = 0;
+
+//-----------------------------------------------------------------------------
 // Audio: bridge DOOM's 11025Hz stereo mix to UVM's 44100Hz stereo output.
 //
 // UVM's audio output supports 44100Hz, i16, with a fixed 1024-sample-per-channel
@@ -348,17 +369,23 @@ int16_t* audio_cb(uint64_t num_channels, uint64_t num_samples)
         {
             // Pull the next 512-frame stereo block from DOOM and upsample 4x
             // into g_mix, keeping the left and right channels separate.
+            // PureDOOM's mixer level is restored to the engine's intended
+            // scale in I_StartSound (see the [UVM] note there); on top of
+            // that, boost 2x with saturation so SFX sit clearly above the
+            // music synth (point-blank blasts will clip a little; fine).
             pthread_mutex_lock(&g_doom_lock);
             int16_t* db = doom_get_sound_buffer();
             for (int f = 0; f < DOOM_FRAMES; ++f)
             {
-                int16_t l = db[2 * f];
-                int16_t r = db[2 * f + 1];
+                int32_t l = 2 * (int32_t)db[2 * f];
+                int32_t r = 2 * (int32_t)db[2 * f + 1];
+                if (l > 32767) l = 32767; else if (l < -32768) l = -32768;
+                if (r > 32767) r = 32767; else if (r < -32768) r = -32768;
                 for (int u = 0; u < UPSAMPLE; ++u)
                 {
                     int m = (f * UPSAMPLE + u) * 2;
-                    g_mix[m]     = l;
-                    g_mix[m + 1] = r;
+                    g_mix[m]     = (int16_t)l;
+                    g_mix[m + 1] = (int16_t)r;
                 }
             }
             pthread_mutex_unlock(&g_doom_lock);
@@ -370,26 +397,34 @@ int16_t* audio_cb(uint64_t num_channels, uint64_t num_samples)
         ++g_mix_pos;
     }
 
+    // Music: drain DOOM's MIDI stream into the synth at 140Hz and render the
+    // synth on top of the SFX, in sub-blocks so the MIDI pumps land on their
+    // exact sample positions within this callback block.
+    uint64_t pos = 0;
+    while (pos < num_samples)
+    {
+        if (g_midi_countdown <= 0)
+        {
+            // doom_tick_midi() touches DOOM's music state, which the game
+            // thread also mutates (song changes, volume) — take the lock.
+            pthread_mutex_lock(&g_doom_lock);
+            unsigned long midi_msg;
+            while ((midi_msg = doom_tick_midi()) != 0)
+                synth_midi((uint32_t)midi_msg);
+            pthread_mutex_unlock(&g_doom_lock);
+            g_midi_countdown = MIDI_PUMP_FRAMES;
+        }
+
+        uint64_t n = num_samples - pos;
+        if (n > (uint64_t)g_midi_countdown)
+            n = (uint64_t)g_midi_countdown;
+        synth_render(g_out + 2 * pos, (int)n);
+        g_midi_countdown -= (int)n;
+        pos += n;
+    }
+
     return g_out;
 }
-
-//-----------------------------------------------------------------------------
-// Music (MIDI) — DISABLED on UVM.
-//
-// The original SDL port turned DOOM's MIDI stream into music using a
-// platform software synth (CoreAudio's DLS synth on macOS). UVM has no MIDI
-// synthesizer primitive, so there is nothing to forward the MIDI stream to.
-// The code is kept here, commented out, for reference / a future UVM MIDI path.
-//-----------------------------------------------------------------------------
-#if 0
-void send_midi_msg(uint32_t midi_msg) { (void)midi_msg; }
-void setup_midi(void) {}
-
-// Would be called ~140 times/sec to drain DOOM's pending MIDI messages:
-//   unsigned long midi_msg;
-//   while ((midi_msg = doom_tick_midi()) != 0)
-//       send_midi_msg((uint32_t)midi_msg);
-#endif
 
 // When non-NULL, the name of a demo lump to benchmark under -timedemo (set by
 // build_doom_argv). Points into the argv the VM handed us, which lives for the
@@ -475,10 +510,11 @@ int main(int argc, char** argv)
 
     // Only now that DOOM is initialized is it safe for the audio thread to call
     // into it. Open the stereo 44100Hz output, which spawns the audio callback
-    // thread. (Music/MIDI is disabled; see the block above.) Skip audio when
+    // thread that mixes SFX and the music synth (see synth.c). Skip audio when
     // benchmarking so the audio thread's lock contention doesn't skew timings.
     if (!benchmark)
     {
+        synth_init();
         g_audio_ready = 1;
         audio_open_output(44100, 2, AUDIO_FORMAT_I16, (void*)audio_cb);
     }
