@@ -1,0 +1,6 @@
+# DOOM runtime artifacts (written by the game at runtime)
+config.cfg
+doomsav*.dsg
+
+# Build output
+*.asm
