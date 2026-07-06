@@ -2,7 +2,7 @@
 
 A port of Doom that runs on the [UVM virtual machine](https://github.com/maximecb/uvm). Based on
 [PureDOOM](https://github.com/Daivuk/PureDOOM), with a few performance optimizations to make it
-run smoothly on UVM.
+run smoothly on UVM, and a simple MIDI synth so we can enjoy Doom's badass soundtrack.
 
 <p align="center">
   <img src="uvm_doom.jpg" width="700" />
