@@ -10,8 +10,8 @@
 // Known limitations of the UVM backend (see the notes at each call site):
 //   - Music is disabled: UVM has no MIDI synthesizer primitive, so the MIDI
 //     code from the original SDL port is commented out below.
-//   - UVM audio output is mono, 44100Hz, i16 only, so DOOM's 11025Hz stereo mix
-//     is downmixed to mono and upsampled 4x in the audio callback.
+//   - UVM audio output is 44100Hz, i16 only, so DOOM's 11025Hz stereo mix is
+//     upsampled 4x (keeping left/right separation) in the audio callback.
 //   - UVM has no relative-mouse / pointer-lock mode, so mouse look is derived
 //     from absolute cursor deltas and stops at the window edges.
 //   - UVM exposes no CTRL/ALT/function keys, so use the mouse buttons to fire
@@ -303,18 +303,19 @@ void vm_present_frame(const unsigned char* indexed, int width, int height)
 }
 
 //-----------------------------------------------------------------------------
-// Audio: bridge DOOM's 11025Hz stereo mix to UVM's 44100Hz mono output.
+// Audio: bridge DOOM's 11025Hz stereo mix to UVM's 44100Hz stereo output.
 //
-// UVM's audio output only supports 44100Hz, mono, i16, with a fixed 1024-sample
+// UVM's audio output supports 44100Hz, i16, with a fixed 1024-sample-per-channel
 // callback block. DOOM produces 512 stereo frames per doom_get_sound_buffer()
-// call at 11025Hz. We downmix each stereo frame to mono and upsample 4x
-// (44100 / 11025 == 4 exactly) by sample replication, buffering one DOOM block
-// (512 * 4 = 2048 mono samples) and serving it 1024 samples at a time.
+// call at 11025Hz. We upsample 4x (44100 / 11025 == 4 exactly) by frame
+// replication, preserving DOOM's left/right separation, buffering one DOOM block
+// (512 * 4 = 2048 stereo frames) and serving it 1024 frames at a time. Output
+// samples are interleaved L R L R, as UVM expects for stereo.
 //-----------------------------------------------------------------------------
 
 #define DOOM_FRAMES 512               // stereo frames per doom_get_sound_buffer()
 #define UPSAMPLE 4                    // 44100 / 11025
-#define MIX_SAMPLES (DOOM_FRAMES * UPSAMPLE) // 2048 mono samples @ 44100Hz
+#define MIX_FRAMES (DOOM_FRAMES * UPSAMPLE) // 2048 stereo frames @ 44100Hz
 
 // doom_get_sound_buffer() and doom_update() both touch DOOM's sound state, and
 // the audio callback runs on its own UVM thread, so serialize them with a lock.
@@ -324,14 +325,16 @@ static pthread_mutex_t g_doom_lock = PTHREAD_MUTEX_INITIALIZER;
 // before it exists.
 static volatile int g_audio_ready = 0;
 
-static int16_t g_mix[MIX_SAMPLES];    // upsampled mono samples from one DOOM block
-static int g_mix_pos = MIX_SAMPLES;   // read cursor; == MIX_SAMPLES forces a refill
-static int16_t g_out[1024];           // buffer returned to UVM (fixed 1024 block)
+static int16_t g_mix[MIX_FRAMES * 2]; // upsampled interleaved L R frames from one DOOM block
+static int g_mix_pos = MIX_FRAMES;    // read cursor in frames; == MIX_FRAMES forces a refill
+static int16_t g_out[1024 * 2];       // buffer returned to UVM (interleaved L R, 1024-frame block)
 
 // Called by UVM on a dedicated audio thread to fill a block of output samples.
+// num_samples is the number of frames (samples per channel); output is
+// interleaved across num_channels (2 for stereo).
 int16_t* audio_cb(uint64_t num_channels, uint64_t num_samples)
 {
-    (void)num_channels; // always 1 (UVM output is mono)
+    (void)num_channels; // always 2 (stereo output opened below)
 
     if (!g_audio_ready)
     {
@@ -341,23 +344,30 @@ int16_t* audio_cb(uint64_t num_channels, uint64_t num_samples)
 
     for (uint64_t i = 0; i < num_samples; ++i)
     {
-        if (g_mix_pos >= MIX_SAMPLES)
+        if (g_mix_pos >= MIX_FRAMES)
         {
-            // Pull the next 512-frame stereo block from DOOM, downmix to mono
-            // and upsample 4x into g_mix.
+            // Pull the next 512-frame stereo block from DOOM and upsample 4x
+            // into g_mix, keeping the left and right channels separate.
             pthread_mutex_lock(&g_doom_lock);
             int16_t* db = doom_get_sound_buffer();
             for (int f = 0; f < DOOM_FRAMES; ++f)
             {
-                int32_t mono = ((int32_t)db[2 * f] + (int32_t)db[2 * f + 1]) / 2;
+                int16_t l = db[2 * f];
+                int16_t r = db[2 * f + 1];
                 for (int u = 0; u < UPSAMPLE; ++u)
-                    g_mix[f * UPSAMPLE + u] = (int16_t)mono;
+                {
+                    int m = (f * UPSAMPLE + u) * 2;
+                    g_mix[m]     = l;
+                    g_mix[m + 1] = r;
+                }
             }
             pthread_mutex_unlock(&g_doom_lock);
             g_mix_pos = 0;
         }
 
-        g_out[i] = g_mix[g_mix_pos++];
+        g_out[2 * i]     = g_mix[2 * g_mix_pos];
+        g_out[2 * i + 1] = g_mix[2 * g_mix_pos + 1];
+        ++g_mix_pos;
     }
 
     return g_out;
@@ -464,13 +474,13 @@ int main(int argc, char** argv)
     }
 
     // Only now that DOOM is initialized is it safe for the audio thread to call
-    // into it. Open the mono 44100Hz output, which spawns the audio callback
+    // into it. Open the stereo 44100Hz output, which spawns the audio callback
     // thread. (Music/MIDI is disabled; see the block above.) Skip audio when
     // benchmarking so the audio thread's lock contention doesn't skew timings.
     if (!benchmark)
     {
         g_audio_ready = 1;
-        audio_open_output(44100, 1, AUDIO_FORMAT_I16, (void*)audio_cb);
+        audio_open_output(44100, 2, AUDIO_FORMAT_I16, (void*)audio_cb);
     }
 
     // Target ~60 FPS. doom_update() additionally self-throttles game logic to
