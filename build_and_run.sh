@@ -1,7 +1,9 @@
 #!/bin/sh
 # Build the PureDOOM/UVM front-end with uvclang and run it on the UVM VM.
 #
-#   ./build_and_run.sh
+#   ./build_and_run.sh [args...]
+#
+# Any extra arguments are forwarded to UVM DOOM (e.g. ./build_and_run.sh -timedemo).
 #
 # Steps:
 #   1. Fetch the uvm git submodule if it isn't checked out yet.
@@ -32,4 +34,4 @@ fi
 
 # 3. Run UVM DOOM on the VM (release build).
 echo "Launching UVM DOOM..."
-RUST_BACKTRACE=1 exec cargo run --release --manifest-path uvm/vm/Cargo.toml -- out.asm
+RUST_BACKTRACE=1 exec cargo run --release --manifest-path uvm/vm/Cargo.toml -- out.asm "$@"
