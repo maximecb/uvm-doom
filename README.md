@@ -3,7 +3,7 @@
 UVM port of Doom
 
 <p align="center">
-  <img src="uvm_doom.jpg" width="600" />
+  <img src="uvm_doom.jpg" width="700" />
 </p>
 
 ## Getting the code
