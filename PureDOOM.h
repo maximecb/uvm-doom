@@ -1206,9 +1206,14 @@ typedef enum
 #define KEY_F11         (0x80+0x57)
 #define KEY_F12         (0x80+0x58)
 
+// KEY_BACKSPACE and KEY_EQUALS are also defined by UVM's <uvm/syscalls.h> (with
+// different values); undef first so DOOM's internal keymap uses its own values
+// without a -Wmacro-redefined warning.
+#undef KEY_BACKSPACE
 #define KEY_BACKSPACE   127
 #define KEY_PAUSE       0xff
 
+#undef KEY_EQUALS
 #define KEY_EQUALS      0x3d
 #define KEY_MINUS       0x2d
 
@@ -9703,7 +9708,7 @@ void IdentifyVersion(void)
     }
 
     void* f;
-    if (f = doom_open(doom2fwad, "rb"))
+    if ((f = doom_open(doom2fwad, "rb")))
     {
         doom_close(f);
         gamemode = commercial;
@@ -9715,7 +9720,7 @@ void IdentifyVersion(void)
         return;
     }
 
-    if (f = doom_open(doom2wad, "rb"))
+    if ((f = doom_open(doom2wad, "rb")))
     {
         doom_close(f);
         gamemode = commercial;
@@ -9723,7 +9728,7 @@ void IdentifyVersion(void)
         return;
     }
 
-    if (f = doom_open(plutoniawad, "rb"))
+    if ((f = doom_open(plutoniawad, "rb")))
     {
         doom_close(f);
         gamemode = commercial;
@@ -9731,7 +9736,7 @@ void IdentifyVersion(void)
         return;
     }
 
-    if (f = doom_open(tntwad, "rb"))
+    if ((f = doom_open(tntwad, "rb")))
     {
         doom_close(f);
         gamemode = commercial;
@@ -9739,7 +9744,7 @@ void IdentifyVersion(void)
         return;
     }
 
-    if (f = doom_open(doomuwad, "rb"))
+    if ((f = doom_open(doomuwad, "rb")))
     {
         doom_close(f);
         gamemode = retail;
@@ -9747,7 +9752,7 @@ void IdentifyVersion(void)
         return;
     }
 
-    if (f = doom_open(doomwad, "rb"))
+    if ((f = doom_open(doomwad, "rb")))
     {
         doom_close(f);
         gamemode = registered;
@@ -9755,7 +9760,7 @@ void IdentifyVersion(void)
         return;
     }
 
-    if (f = doom_open(doom1wad, "rb"))
+    if ((f = doom_open(doom1wad, "rb")))
     {
         doom_close(f);
         gamemode = shareware;
@@ -12472,8 +12477,8 @@ void G_DoLoadLevel(void)
     // DOOM determines the sky texture to be used
     // depending on the current episode, and the game version.
     if ((gamemode == commercial)
-        || (gamemode == pack_tnt)
-        || (gamemode == pack_plut))
+        || ((int)gamemode == pack_tnt)
+        || ((int)gamemode == pack_plut))
     {
         skytexture = R_TextureNumForName("SKY3");
         if (gamemap < 12)
@@ -16487,80 +16492,80 @@ char* sprnames[NUMSPRITES + 1] = {
 };
 
 
-void A_Light0();
-void A_WeaponReady();
-void A_Lower();
-void A_Raise();
-void A_Punch();
-void A_ReFire();
-void A_FirePistol();
-void A_Light1();
-void A_FireShotgun();
-void A_Light2();
-void A_FireShotgun2();
-void A_CheckReload();
-void A_OpenShotgun2();
-void A_LoadShotgun2();
-void A_CloseShotgun2();
-void A_FireCGun();
-void A_GunFlash();
-void A_FireMissile();
-void A_Saw();
-void A_FirePlasma();
-void A_BFGsound();
-void A_FireBFG();
-void A_BFGSpray();
-void A_Explode();
-void A_Pain();
-void A_PlayerScream();
-void A_Fall();
-void A_XScream();
-void A_Look();
-void A_Chase();
-void A_FaceTarget();
-void A_PosAttack();
-void A_Scream();
-void A_SPosAttack();
-void A_VileChase();
-void A_VileStart();
-void A_VileTarget();
-void A_VileAttack();
-void A_StartFire();
-void A_Fire();
-void A_FireCrackle();
-void A_Tracer();
-void A_SkelWhoosh();
-void A_SkelFist();
-void A_SkelMissile();
-void A_FatRaise();
-void A_FatAttack1();
-void A_FatAttack2();
-void A_FatAttack3();
-void A_BossDeath();
-void A_CPosAttack();
-void A_CPosRefire();
-void A_TroopAttack();
-void A_SargAttack();
-void A_HeadAttack();
-void A_BruisAttack();
-void A_SkullAttack();
-void A_Metal();
-void A_SpidRefire();
-void A_BabyMetal();
-void A_BspiAttack();
-void A_Hoof();
-void A_CyberAttack();
-void A_PainAttack();
-void A_PainDie();
-void A_KeenDie();
-void A_BrainPain();
-void A_BrainScream();
-void A_BrainDie();
-void A_BrainAwake();
-void A_BrainSpit();
-void A_SpawnSound();
-void A_SpawnFly();
-void A_BrainExplode();
+void A_Light0(player_t*, pspdef_t*);
+void A_WeaponReady(player_t*, pspdef_t*);
+void A_Lower(player_t*, pspdef_t*);
+void A_Raise(player_t*, pspdef_t*);
+void A_Punch(player_t*, pspdef_t*);
+void A_ReFire(player_t*, pspdef_t*);
+void A_FirePistol(player_t*, pspdef_t*);
+void A_Light1(player_t*, pspdef_t*);
+void A_FireShotgun(player_t*, pspdef_t*);
+void A_Light2(player_t*, pspdef_t*);
+void A_FireShotgun2(player_t*, pspdef_t*);
+void A_CheckReload(player_t*, pspdef_t*);
+void A_OpenShotgun2(player_t*, pspdef_t*);
+void A_LoadShotgun2(player_t*, pspdef_t*);
+void A_CloseShotgun2(player_t*, pspdef_t*);
+void A_FireCGun(player_t*, pspdef_t*);
+void A_GunFlash(player_t*, pspdef_t*);
+void A_FireMissile(player_t*, pspdef_t*);
+void A_Saw(player_t*, pspdef_t*);
+void A_FirePlasma(player_t*, pspdef_t*);
+void A_BFGsound(player_t*, pspdef_t*);
+void A_FireBFG(player_t*, pspdef_t*);
+void A_BFGSpray(mobj_t*);
+void A_Explode(mobj_t*);
+void A_Pain(mobj_t*);
+void A_PlayerScream(mobj_t*);
+void A_Fall(mobj_t*);
+void A_XScream(mobj_t*);
+void A_Look(mobj_t*);
+void A_Chase(mobj_t*);
+void A_FaceTarget(mobj_t*);
+void A_PosAttack(mobj_t*);
+void A_Scream(mobj_t*);
+void A_SPosAttack(mobj_t*);
+void A_VileChase(mobj_t*);
+void A_VileStart(mobj_t*);
+void A_VileTarget(mobj_t*);
+void A_VileAttack(mobj_t*);
+void A_StartFire(mobj_t*);
+void A_Fire(mobj_t*);
+void A_FireCrackle(mobj_t*);
+void A_Tracer(mobj_t*);
+void A_SkelWhoosh(mobj_t*);
+void A_SkelFist(mobj_t*);
+void A_SkelMissile(mobj_t*);
+void A_FatRaise(mobj_t*);
+void A_FatAttack1(mobj_t*);
+void A_FatAttack2(mobj_t*);
+void A_FatAttack3(mobj_t*);
+void A_BossDeath(mobj_t*);
+void A_CPosAttack(mobj_t*);
+void A_CPosRefire(mobj_t*);
+void A_TroopAttack(mobj_t*);
+void A_SargAttack(mobj_t*);
+void A_HeadAttack(mobj_t*);
+void A_BruisAttack(mobj_t*);
+void A_SkullAttack(mobj_t*);
+void A_Metal(mobj_t*);
+void A_SpidRefire(mobj_t*);
+void A_BabyMetal(mobj_t*);
+void A_BspiAttack(mobj_t*);
+void A_Hoof(mobj_t*);
+void A_CyberAttack(mobj_t*);
+void A_PainAttack(mobj_t*);
+void A_PainDie(mobj_t*);
+void A_KeenDie(mobj_t*);
+void A_BrainPain(mobj_t*);
+void A_BrainScream(mobj_t*);
+void A_BrainDie(mobj_t*);
+void A_BrainAwake(mobj_t*);
+void A_BrainSpit(mobj_t*);
+void A_SpawnSound(mobj_t*);
+void A_SpawnFly(mobj_t*);
+void A_BrainExplode(mobj_t*);
 
 
 state_t states[NUMSTATES] = {

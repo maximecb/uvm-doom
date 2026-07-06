@@ -314,7 +314,7 @@ int16_t* audio_cb(uint64_t num_channels, uint64_t num_samples)
 
     if (!g_audio_ready)
     {
-        memset(g_out, 0, sizeof(g_out));
+        memset((uint8_t*)g_out, 0, sizeof(g_out));
         return g_out;
     }
 
