@@ -1,6 +1,8 @@
 # uvm-doom
 
-UVM port of Doom
+A port of Doom that runs on the [UVM virtual machine](https://github.com/maximecb/uvm). Based on
+[PureDOOM](https://github.com/Daivuk/PureDOOM), with a few performance optimizations to make it
+run smoothly on UVM.
 
 <p align="center">
   <img src="uvm_doom.jpg" width="700" />
