@@ -274,7 +274,7 @@ void vm_present_frame(const unsigned char* indexed, int width, int height)
         uint32_t* dst = row0;
         for (int x = 0; x < width; ++x)
         {
-            uint32_t c = lut[srow[x]];
+            uint32_t c = lut[*srow++];
 #if SCALE == 3
             // Unrolled horizontal splat for the fixed 3x scale (no inner loop
             // control per pixel).
@@ -292,8 +292,8 @@ void vm_present_frame(const unsigned char* indexed, int width, int height)
         // copy the finished row with a native memcpy instead of recomputing and
         // re-writing every pixel (which was SCALE-1 redundant passes).
         for (int dy = 1; dy < SCALE; ++dy)
-            memcpy((uint8_t*)&g_win_pixels[(y * SCALE + dy) * WIN_WIDTH],
-                   (const uint8_t*)row0, WIN_WIDTH * sizeof(uint32_t));
+            memcpy(&g_win_pixels[(y * SCALE + dy) * WIN_WIDTH],
+                   row0, WIN_WIDTH * sizeof(uint32_t));
     }
 
     // In benchmark mode there is no window; we still ran the upscale above so

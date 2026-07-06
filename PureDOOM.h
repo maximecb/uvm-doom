@@ -973,8 +973,6 @@ extern doom_getenv_fn doom_getenv;
 const char* doom_itoa(int i, int radix);
 const char* doom_ctoa(char c);
 const char* doom_ptoa(void* p);
-void doom_memset(void* ptr, int value, int num);
-void* doom_memcpy(void* destination, const void* source, int num);
 int doom_fprint(void* handle, const char* str);
 int doom_strlen(const char* str);
 char* doom_concat(char* dst, const char* src);
@@ -7016,7 +7014,6 @@ extern int numdefaults;
 extern signed short mixbuffer[2048];
 
 
-static unsigned char* screen_buffer = 0;
 static unsigned char* final_screen_buffer = 0;
 
 // [UVM] Palette->BGRA lookup table, rebuilt whenever the palette changes (see
@@ -7202,27 +7199,33 @@ char* doom_getenv_impl(const char* var) { return 0; }
 #endif
 
 
-void doom_memset(void* ptr, int value, int num)
+// [UVM] Back memcpy with the native UVM memcpy syscall. <uvm/syscalls.h>
+// (pulled in by <stdlib.h>/<stdio.h> ahead of this header) exposes memcpy only
+// as a macro over __uvm_memcpy whose parameters are strictly uint8_t*, which
+// would warn on every typed-pointer copy in the engine below. Undefine it and
+// give memcpy its real void* signature so DOOM's raw-byte copies compile clean
+// while still lowering to the native syscall -- no interpreted byte loop.
+#ifdef memcpy
+#undef memcpy
+#endif
+void* memcpy(void* dst, const void* src, size_t num)
 {
-    unsigned char* p = ptr;
-    for (int i = 0; i < num; ++i, ++p)
-    {
-        *p = (unsigned char)value;
-    }
+    __uvm_memcpy((uint8_t*)dst, (const uint8_t*)src, num);
+    return dst;
 }
 
 
-void* doom_memcpy(void* destination, const void* source, int num)
+// [UVM] Same treatment for memset (see the memcpy note above): back it with the
+// native UVM memset syscall instead of an interpreted byte loop. This is on the
+// per-frame path -- the renderer clears cachedheight once per frame and a
+// visplane's top[] once per visplane in R_FindPlane/R_CheckPlane.
+#ifdef memset
+#undef memset
+#endif
+void* memset(void* dst, int value, size_t num)
 {
-    unsigned char* dst = destination;
-    const unsigned char* src = source;
-
-    for (int i = 0; i < num; ++i, ++dst, ++src)
-    {
-        *dst = *src;
-    }
-
-    return destination;
+    __uvm_memset((uint8_t*)dst, (uint8_t)value, num);
+    return dst;
 }
 
 
@@ -7561,7 +7564,6 @@ void doom_init(int argc, char** argv, int flags)
     if (!doom_exit) doom_exit = doom_exit_impl;
     if (!doom_getenv) doom_getenv = doom_getenv_impl;
 
-    screen_buffer = doom_malloc(SCREENWIDTH * SCREENHEIGHT);
     final_screen_buffer = doom_malloc(SCREENWIDTH * SCREENHEIGHT * 4);
     last_update_time = I_GetTime();
 
@@ -7603,15 +7605,20 @@ const unsigned char* doom_get_framebuffer(int channels)
 {
     int i, len;
 
-    doom_memcpy(screen_buffer, screens[0], SCREENWIDTH * SCREENHEIGHT);
+    // [UVM] Draw straight into DOOM's composed frame (screens[0]) instead of
+    // copying it into a scratch buffer first. screens[0] is fully recomposed by
+    // the renderer every frame, so the crosshair pixels we poke in here are
+    // transient and overwritten next frame. This drops a per-frame 64000-byte
+    // scratch copy.
+    unsigned char* fb = screens[0];
 
     extern doom_boolean menuactive;
-    extern gamestate_t gamestate; 
+    extern gamestate_t gamestate;
     extern doom_boolean automapactive;
     extern int crosshair;
 
     // Draw crosshair
-    if (crosshair && 
+    if (crosshair &&
         !menuactive &&
         gamestate == GS_LEVEL &&
         !automapactive)
@@ -7622,26 +7629,26 @@ const unsigned char* doom_get_framebuffer(int channels)
         else y = SCREENHEIGHT / 2 - 8;
         for (i = 0; i < 2; ++i)
         {
-            screen_buffer[SCREENWIDTH / 2 - 2 - i + y * SCREENWIDTH] = 4;
-            screen_buffer[SCREENWIDTH / 2 + 2 + i + y * SCREENWIDTH] = 4;
+            fb[SCREENWIDTH / 2 - 2 - i + y * SCREENWIDTH] = 4;
+            fb[SCREENWIDTH / 2 + 2 + i + y * SCREENWIDTH] = 4;
         }
         for (i = 0; i < 2; ++i)
         {
-            screen_buffer[SCREENWIDTH / 2 + (y - 2 - i) * SCREENWIDTH] = 4;
-            screen_buffer[SCREENWIDTH / 2 + (y + 2 + i) * SCREENWIDTH] = 4;
+            fb[SCREENWIDTH / 2 + (y - 2 - i) * SCREENWIDTH] = 4;
+            fb[SCREENWIDTH / 2 + (y + 2 + i) * SCREENWIDTH] = 4;
         }
     }
 
     if (channels == 1)
     {
-        return screen_buffer;
+        return fb;
     }
     else if (channels == 3)
     {
         for (i = 0, len = SCREENWIDTH * SCREENHEIGHT; i < len; ++i)
         {
             int k = i * 3;
-            int kpal = screen_buffer[i] * 3;
+            int kpal = fb[i] * 3;
             final_screen_buffer[k + 0] = screen_palette[kpal + 0];
             final_screen_buffer[k + 1] = screen_palette[kpal + 1];
             final_screen_buffer[k + 2] = screen_palette[kpal + 2];
@@ -7656,7 +7663,7 @@ const unsigned char* doom_get_framebuffer(int channels)
         // address and A in the high byte (see bgra_lut / I_SetPalette).
         uint32_t* dst32 = (uint32_t*)final_screen_buffer;
         for (i = 0, len = SCREENWIDTH * SCREENHEIGHT; i < len; ++i)
-            dst32[i] = bgra_lut[screen_buffer[i]];
+            dst32[i] = bgra_lut[fb[i]];
         return final_screen_buffer;
     }
     else
@@ -8528,7 +8535,7 @@ void AM_Ticker(void)
 //
 void AM_clearFB(int color)
 {
-    doom_memset(fb, color, f_w * f_h);
+    memset(fb, color, f_w * f_h);
 }
 
 
@@ -9833,7 +9840,7 @@ void FindResponseFile(void)
 
             firstargv = myargv[0];
             myargv = doom_malloc(sizeof(char*) * MAXARGVS);
-            doom_memset(myargv, 0, sizeof(char*) * MAXARGVS);
+            memset(myargv, 0, sizeof(char*) * MAXARGVS);
             myargv[0] = firstargv;
 
             infile = file;
@@ -10845,7 +10852,7 @@ void D_ArbitrateNetStart(void)
     doom_boolean gotinfo[MAXNETNODES];
 
     autostart = true;
-    doom_memset(gotinfo, 0, sizeof(gotinfo));
+    memset(gotinfo, 0, sizeof(gotinfo));
 
     if (doomcom->consoleplayer)
     {
@@ -11458,12 +11465,12 @@ void F_TextWrite(void)
     {
         for (x = 0; x < SCREENWIDTH / 64; x++)
         {
-            doom_memcpy(dest, src + ((y & 63) << 6), 64);
+            memcpy(dest, src + ((y & 63) << 6), 64);
             dest += 64;
         }
         if (SCREENWIDTH & 63)
         {
-            doom_memcpy(dest, src + ((y & 63) << 6), SCREENWIDTH & 63);
+            memcpy(dest, src + ((y & 63) << 6), SCREENWIDTH & 63);
             dest += (SCREENWIDTH & 63);
         }
     }
@@ -11885,7 +11892,7 @@ void wipe_shittyColMajorXform(short* array, int width, int height)
         for (x = 0; x < width; x++)
             dest[x * height + y] = array[y * width + x];
 
-    doom_memcpy(array, dest, width * height * 2);
+    memcpy(array, dest, width * height * 2);
 
     Z_Free(dest);
 }
@@ -11893,7 +11900,7 @@ void wipe_shittyColMajorXform(short* array, int width, int height)
 
 int wipe_initColorXForm(int width, int height, int ticks)
 {
-    doom_memcpy(wipe_scr, wipe_scr_start, width * height);
+    memcpy(wipe_scr, wipe_scr_start, width * height);
     return 0;
 }
 
@@ -11951,7 +11958,7 @@ int wipe_initMelt(int width, int height, int ticks)
     int i, r;
 
     // copy start screen to main screen
-    doom_memcpy(wipe_scr, wipe_scr_start, width * height);
+    memcpy(wipe_scr, wipe_scr_start, width * height);
 
     // makes this wipe faster (in theory)
     // to have stuff in column-major format
@@ -12287,7 +12294,7 @@ void G_BuildTiccmd(ticcmd_t* cmd)
     ticcmd_t* base;
 
     base = I_BaseTiccmd();                // empty, or external driver
-    doom_memcpy(cmd, base, sizeof(*cmd));
+    memcpy(cmd, base, sizeof(*cmd));
 
     cmd->consistancy =
         consistancy[consoleplayer][maketic % BACKUPTICS];
@@ -12516,7 +12523,7 @@ void G_DoLoadLevel(void)
     {
         if (playeringame[i] && players[i].playerstate == PST_DEAD)
             players[i].playerstate = PST_REBORN;
-        doom_memset(players[i].frags, 0, sizeof(players[i].frags));
+        memset(players[i].frags, 0, sizeof(players[i].frags));
     }
 
     P_SetupLevel(gameepisode, gamemap, 0, gameskill);
@@ -12526,12 +12533,12 @@ void G_DoLoadLevel(void)
     Z_CheckHeap();
 
     // clear cmd building stuff
-    doom_memset(gamekeydown, 0, sizeof(gamekeydown));
+    memset(gamekeydown, 0, sizeof(gamekeydown));
     joyxmove = joyymove = 0;
     mousex = mousey = 0;
     sendpause = sendsave = paused = false;
-    doom_memset(mousebuttons, 0, sizeof(*mousebuttons) * 3);
-    doom_memset(joybuttons, 0, sizeof(*joybuttons) * 4);
+    memset(mousebuttons, 0, sizeof(*mousebuttons) * 3);
+    memset(joybuttons, 0, sizeof(*joybuttons) * 4);
 }
 
 
@@ -12699,7 +12706,7 @@ void G_Ticker(void)
         {
             cmd = &players[i].cmd;
 
-            doom_memcpy(cmd, &netcmds[i][buf], sizeof(ticcmd_t));
+            memcpy(cmd, &netcmds[i][buf], sizeof(ticcmd_t));
 
             if (demoplayback)
                 G_ReadDemoTiccmd(cmd);
@@ -12827,8 +12834,8 @@ void G_PlayerFinishLevel(int player)
 
     p = &players[player];
 
-    doom_memset(p->powers, 0, sizeof(p->powers));
-    doom_memset(p->cards, 0, sizeof(p->cards));
+    memset(p->powers, 0, sizeof(p->powers));
+    memset(p->cards, 0, sizeof(p->cards));
     p->mo->flags &= ~MF_SHADOW; // cancel invisibility 
     p->extralight = 0; // cancel gun flashes 
     p->fixedcolormap = 0; // cancel ir gogles 
@@ -12851,15 +12858,15 @@ void G_PlayerReborn(int player)
     int itemcount;
     int secretcount;
 
-    doom_memcpy(frags, players[player].frags, sizeof(frags));
+    memcpy(frags, players[player].frags, sizeof(frags));
     killcount = players[player].killcount;
     itemcount = players[player].itemcount;
     secretcount = players[player].secretcount;
 
     p = &players[player];
-    doom_memset(p, 0, sizeof(*p));
+    memset(p, 0, sizeof(*p));
 
-    doom_memcpy(players[player].frags, frags, sizeof(players[player].frags));
+    memcpy(players[player].frags, frags, sizeof(players[player].frags));
     players[player].killcount = killcount;
     players[player].itemcount = itemcount;
     players[player].secretcount = secretcount;
@@ -13148,7 +13155,7 @@ void G_DoCompleted(void)
         wminfo.plyr[i].sitems = players[i].itemcount;
         wminfo.plyr[i].ssecret = players[i].secretcount;
         wminfo.plyr[i].stime = leveltime;
-        doom_memcpy(wminfo.plyr[i].frags, players[i].frags
+        memcpy(wminfo.plyr[i].frags, players[i].frags
                , sizeof(wminfo.plyr[i].frags));
     }
 
@@ -13157,7 +13164,7 @@ void G_DoCompleted(void)
     automapactive = false;
 
     if (statcopy)
-        doom_memcpy(statcopy, &wminfo, sizeof(wminfo));
+        memcpy(statcopy, &wminfo, sizeof(wminfo));
 
     WI_Start(&wminfo);
 }
@@ -13227,7 +13234,7 @@ void G_DoLoadGame(void)
     save_p = savebuffer + SAVESTRINGSIZE;
 
     // skip the description field 
-    doom_memset(vcheck, 0, sizeof(vcheck));
+    memset(vcheck, 0, sizeof(vcheck));
     //doom_sprintf(vcheck, "version %i", VERSION);
     doom_strcpy(vcheck, "version ");
     doom_concat(vcheck, doom_itoa(VERSION, 10));
@@ -13305,13 +13312,13 @@ void G_DoSaveGame(void)
 
     save_p = savebuffer = screens[1] + 0x4000;
 
-    doom_memcpy(save_p, description, SAVESTRINGSIZE);
+    memcpy(save_p, description, SAVESTRINGSIZE);
     save_p += SAVESTRINGSIZE;
-    doom_memset(name2, 0, sizeof(name2));
+    memset(name2, 0, sizeof(name2));
     //doom_sprintf(name2, "version %i", VERSION);
     doom_strcpy(name2, "version ");
     doom_concat(name2, doom_itoa(VERSION, 10));
-    doom_memcpy(save_p, name2, VERSIONSIZE);
+    memcpy(save_p, name2, VERSIONSIZE);
     save_p += VERSIONSIZE;
 
     *save_p++ = gameskill;
@@ -14799,7 +14806,7 @@ void BindToLocalPort(SOCKET s, int port)
     int v;
     struct sockaddr_in address;
 
-    doom_memset(&address, 0, sizeof(address));
+    memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = port;
@@ -14997,7 +15004,7 @@ void I_InitNetwork(void)
     struct hostent* hostentry;        // host information entry
 
     doomcom = doom_malloc(sizeof(*doomcom));
-    doom_memset(doomcom, 0, sizeof(*doomcom));
+    memset(doomcom, 0, sizeof(*doomcom));
 
     // set up for network
     i = M_CheckParm("-dup");
@@ -15307,7 +15314,7 @@ void* getsfx(char* sfxname, int* len)
     //  which does not kick in in the soundserver.
 
     // Now copy and pad.
-    doom_memcpy(paddedsfx, sfx, size);
+    memcpy(paddedsfx, sfx, size);
     for (i = size; i < paddedsize + 8; i++)
         paddedsfx[i] = 128;
 
@@ -16086,7 +16093,7 @@ void I_UnRegisterSong(int handle)
 
 int I_RegisterSong(void* data)
 {
-    doom_memcpy(&mus_header, data, sizeof(mus_header_t));
+    memcpy(&mus_header, data, sizeof(mus_header_t));
     if (doom_strncmp(mus_header.ID, "MUS", 3) != 0 || mus_header.ID[3] != 0x1A) return 0;
 
     mus_data = (unsigned char*)data;
@@ -16361,7 +16368,7 @@ byte* I_AllocLow(int length)
     byte* mem;
 
     mem = (byte*)doom_malloc(length);
-    doom_memset(mem, 0, length);
+    memset(mem, 0, length);
     return mem;
 }
 
@@ -16474,7 +16481,7 @@ void I_FinishUpdate(void)
 //
 void I_ReadScreen(byte* scr)
 {
-    doom_memcpy(scr, screens[0], SCREENWIDTH * SCREENHEIGHT);
+    memcpy(scr, screens[0], SCREENWIDTH * SCREENHEIGHT);
 }
 
 
@@ -16483,7 +16490,7 @@ void I_ReadScreen(byte* scr)
 //
 void I_SetPalette(byte* palette)
 {
-    doom_memcpy(screen_palette, palette, 256 * 3);
+    memcpy(screen_palette, palette, 256 * 3);
 
     // [UVM] Rebuild the palette->BGRA lookup table consumed by
     // doom_get_framebuffer and the front-end upscaler. PLAYPAL is RGB source
@@ -23306,7 +23313,7 @@ void M_Drawer(void)
             for (i = 0; i < doom_strlen(messageString + start); i++)
                 if (*(messageString + start + i) == '\n')
                 {
-                    doom_memset(string, 0, 40);
+                    memset(string, 0, 40);
                     doom_strncpy(string, messageString + start, i);
                     start += i + 1;
                     break;
@@ -23419,29 +23426,29 @@ void M_Init(void)
     if (hide_mouse && !hide_sound)
     {
         OptionsMenu = OptionsMenuNoMouse;
-        doom_memcpy(&OptionsDef, &OptionsNoMouseDef, sizeof(OptionsDef));
+        memcpy(&OptionsDef, &OptionsNoMouseDef, sizeof(OptionsDef));
     }
     else if (!hide_mouse && hide_sound)
     {
         OptionsMenu = OptionsMenuNoSound;
-        doom_memcpy(&OptionsDef, &OptionsNoSoundDef, sizeof(OptionsDef));
+        memcpy(&OptionsDef, &OptionsNoSoundDef, sizeof(OptionsDef));
     }
     else if (hide_mouse && hide_sound)
     {
         OptionsMenu = OptionsMenuNoSoundNoMouse;
-        doom_memcpy(&OptionsDef, &OptionsNoSoundNoMouseDef, sizeof(OptionsDef));
+        memcpy(&OptionsDef, &OptionsNoSoundNoMouseDef, sizeof(OptionsDef));
     }
 
     SoundMenu = SoundMenuFull;
     if (doom_flags & DOOM_FLAG_HIDE_MUSIC_OPTIONS)
     {
         SoundMenu = SoundMenuNoMusic;
-        doom_memcpy(&SoundDef, &SoundNoMusicDef, sizeof(SoundDef));
+        memcpy(&SoundDef, &SoundNoMusicDef, sizeof(SoundDef));
     }
     else if (doom_flags & DOOM_FLAG_HIDE_SOUND_OPTIONS)
     {
         SoundMenu = SoundMenuNoSFX;
-        doom_memcpy(&SoundDef, &SoundNoSFXDef, sizeof(SoundDef));
+        memcpy(&SoundDef, &SoundNoSFXDef, sizeof(SoundDef));
     }
 
     currentMenu = &MainDef;
@@ -23917,11 +23924,11 @@ void WritePCXfile(char* filename, byte* data, int width, int height, byte* palet
     pcx->ymax = SHORT(height - 1);
     pcx->hres = SHORT(width);
     pcx->vres = SHORT(height);
-    doom_memset(pcx->palette, 0, sizeof(pcx->palette));
+    memset(pcx->palette, 0, sizeof(pcx->palette));
     pcx->color_planes = 1; // chunky image
     pcx->bytes_per_line = SHORT(width);
     pcx->palette_type = SHORT(2); // not a grey scale
-    doom_memset(pcx->filler, 0, sizeof(pcx->filler));
+    memset(pcx->filler, 0, sizeof(pcx->filler));
 
     // pack the image
     pack = &pcx->data;
@@ -30848,7 +30855,7 @@ mobj_t* P_SpawnMobj(fixed_t x, fixed_t y, fixed_t z, mobjtype_t type)
     mobjinfo_t* info;
 
     mobj = Z_Malloc(sizeof(*mobj), PU_LEVEL, 0);
-    doom_memset(mobj, 0, sizeof(*mobj));
+    memset(mobj, 0, sizeof(*mobj));
     info = &mobjinfo[type];
 
     mobj->type = type;
@@ -31069,7 +31076,7 @@ void P_SpawnMapThing(mapthing_t* mthing)
     {
         if (deathmatch_p < &deathmatchstarts[10])
         {
-            doom_memcpy(deathmatch_p, mthing, sizeof(*mthing));
+            memcpy(deathmatch_p, mthing, sizeof(*mthing));
             deathmatch_p++;
         }
         return;
@@ -32351,7 +32358,7 @@ void P_ArchivePlayers(void)
         PADSAVEP();
 
         dest = (player_t*)save_p;
-        doom_memcpy(dest, &players[i], sizeof(player_t));
+        memcpy(dest, &players[i], sizeof(player_t));
         save_p += sizeof(player_t);
         for (j = 0; j < NUMPSPRITES; j++)
         {
@@ -32380,7 +32387,7 @@ void P_UnArchivePlayers(void)
 
         PADSAVEP();
 
-        doom_memcpy(&players[i], save_p, sizeof(player_t));
+        memcpy(&players[i], save_p, sizeof(player_t));
         save_p += sizeof(player_t);
 
         // will be set when unarc thinker
@@ -32529,7 +32536,7 @@ void P_ArchiveThinkers(void)
             *save_p++ = tc_mobj;
             PADSAVEP();
             mobj = (mobj_t*)save_p;
-            doom_memcpy(mobj, th, sizeof(*mobj));
+            memcpy(mobj, th, sizeof(*mobj));
             save_p += sizeof(*mobj);
             mobj->state = (state_t*)(mobj->state - states);
 
@@ -32583,7 +32590,7 @@ void P_UnArchiveThinkers(void)
             case tc_mobj:
                 PADSAVEP();
                 mobj = Z_Malloc(sizeof(*mobj), PU_LEVEL, 0);
-                doom_memcpy(mobj, save_p, sizeof(*mobj));
+                memcpy(mobj, save_p, sizeof(*mobj));
                 save_p += sizeof(*mobj);
                 mobj->state = &states[(long long)mobj->state];
                 mobj->target = 0;
@@ -32667,7 +32674,7 @@ void P_ArchiveSpecials(void)
                 *save_p++ = tc_ceiling;
                 PADSAVEP();
                 ceiling = (ceiling_t*)save_p;
-                doom_memcpy(ceiling, th, sizeof(*ceiling));
+                memcpy(ceiling, th, sizeof(*ceiling));
                 save_p += sizeof(*ceiling);
                 ceiling->sector = (sector_t*)(ceiling->sector - sectors);
             }
@@ -32679,7 +32686,7 @@ void P_ArchiveSpecials(void)
             *save_p++ = tc_ceiling;
             PADSAVEP();
             ceiling = (ceiling_t*)save_p;
-            doom_memcpy(ceiling, th, sizeof(*ceiling));
+            memcpy(ceiling, th, sizeof(*ceiling));
             save_p += sizeof(*ceiling);
             ceiling->sector = (sector_t*)(ceiling->sector - sectors);
             continue;
@@ -32690,7 +32697,7 @@ void P_ArchiveSpecials(void)
             *save_p++ = tc_door;
             PADSAVEP();
             door = (vldoor_t*)save_p;
-            doom_memcpy(door, th, sizeof(*door));
+            memcpy(door, th, sizeof(*door));
             save_p += sizeof(*door);
             door->sector = (sector_t*)(door->sector - sectors);
             continue;
@@ -32701,7 +32708,7 @@ void P_ArchiveSpecials(void)
             *save_p++ = tc_floor;
             PADSAVEP();
             floor = (floormove_t*)save_p;
-            doom_memcpy(floor, th, sizeof(*floor));
+            memcpy(floor, th, sizeof(*floor));
             save_p += sizeof(*floor);
             floor->sector = (sector_t*)(floor->sector - sectors);
             continue;
@@ -32712,7 +32719,7 @@ void P_ArchiveSpecials(void)
             *save_p++ = tc_plat;
             PADSAVEP();
             plat = (plat_t*)save_p;
-            doom_memcpy(plat, th, sizeof(*plat));
+            memcpy(plat, th, sizeof(*plat));
             save_p += sizeof(*plat);
             plat->sector = (sector_t*)(plat->sector - sectors);
             continue;
@@ -32723,7 +32730,7 @@ void P_ArchiveSpecials(void)
             *save_p++ = tc_flash;
             PADSAVEP();
             flash = (lightflash_t*)save_p;
-            doom_memcpy(flash, th, sizeof(*flash));
+            memcpy(flash, th, sizeof(*flash));
             save_p += sizeof(*flash);
             flash->sector = (sector_t*)(flash->sector - sectors);
             continue;
@@ -32734,7 +32741,7 @@ void P_ArchiveSpecials(void)
             *save_p++ = tc_strobe;
             PADSAVEP();
             strobe = (strobe_t*)save_p;
-            doom_memcpy(strobe, th, sizeof(*strobe));
+            memcpy(strobe, th, sizeof(*strobe));
             save_p += sizeof(*strobe);
             strobe->sector = (sector_t*)(strobe->sector - sectors);
             continue;
@@ -32745,7 +32752,7 @@ void P_ArchiveSpecials(void)
             *save_p++ = tc_glow;
             PADSAVEP();
             glow = (glow_t*)save_p;
-            doom_memcpy(glow, th, sizeof(*glow));
+            memcpy(glow, th, sizeof(*glow));
             save_p += sizeof(*glow);
             glow->sector = (sector_t*)(glow->sector - sectors);
             continue;
@@ -32784,7 +32791,7 @@ void P_UnArchiveSpecials(void)
             case tc_ceiling:
                 PADSAVEP();
                 ceiling = Z_Malloc(sizeof(*ceiling), PU_LEVEL, 0);
-                doom_memcpy(ceiling, save_p, sizeof(*ceiling));
+                memcpy(ceiling, save_p, sizeof(*ceiling));
                 save_p += sizeof(*ceiling);
                 ceiling->sector = &sectors[(long long)ceiling->sector];
                 ceiling->sector->specialdata = ceiling;
@@ -32799,7 +32806,7 @@ void P_UnArchiveSpecials(void)
             case tc_door:
                 PADSAVEP();
                 door = Z_Malloc(sizeof(*door), PU_LEVEL, 0);
-                doom_memcpy(door, save_p, sizeof(*door));
+                memcpy(door, save_p, sizeof(*door));
                 save_p += sizeof(*door);
                 door->sector = &sectors[(long long)door->sector];
                 door->sector->specialdata = door;
@@ -32810,7 +32817,7 @@ void P_UnArchiveSpecials(void)
             case tc_floor:
                 PADSAVEP();
                 floor = Z_Malloc(sizeof(*floor), PU_LEVEL, 0);
-                doom_memcpy(floor, save_p, sizeof(*floor));
+                memcpy(floor, save_p, sizeof(*floor));
                 save_p += sizeof(*floor);
                 floor->sector = &sectors[(long long)floor->sector];
                 floor->sector->specialdata = floor;
@@ -32821,7 +32828,7 @@ void P_UnArchiveSpecials(void)
             case tc_plat:
                 PADSAVEP();
                 plat = Z_Malloc(sizeof(*plat), PU_LEVEL, 0);
-                doom_memcpy(plat, save_p, sizeof(*plat));
+                memcpy(plat, save_p, sizeof(*plat));
                 save_p += sizeof(*plat);
                 plat->sector = &sectors[(long long)plat->sector];
                 plat->sector->specialdata = plat;
@@ -32836,7 +32843,7 @@ void P_UnArchiveSpecials(void)
             case tc_flash:
                 PADSAVEP();
                 flash = Z_Malloc(sizeof(*flash), PU_LEVEL, 0);
-                doom_memcpy(flash, save_p, sizeof(*flash));
+                memcpy(flash, save_p, sizeof(*flash));
                 save_p += sizeof(*flash);
                 flash->sector = &sectors[(long long)flash->sector];
                 flash->thinker.function.acp1 = (actionf_p1)T_LightFlash;
@@ -32846,7 +32853,7 @@ void P_UnArchiveSpecials(void)
             case tc_strobe:
                 PADSAVEP();
                 strobe = Z_Malloc(sizeof(*strobe), PU_LEVEL, 0);
-                doom_memcpy(strobe, save_p, sizeof(*strobe));
+                memcpy(strobe, save_p, sizeof(*strobe));
                 save_p += sizeof(*strobe);
                 strobe->sector = &sectors[(long long)strobe->sector];
                 strobe->thinker.function.acp1 = (actionf_p1)T_StrobeFlash;
@@ -32856,7 +32863,7 @@ void P_UnArchiveSpecials(void)
             case tc_glow:
                 PADSAVEP();
                 glow = Z_Malloc(sizeof(*glow), PU_LEVEL, 0);
-                doom_memcpy(glow, save_p, sizeof(*glow));
+                memcpy(glow, save_p, sizeof(*glow));
                 save_p += sizeof(*glow);
                 glow->sector = &sectors[(long long)glow->sector];
                 glow->thinker.function.acp1 = (actionf_p1)T_Glow;
@@ -32991,7 +32998,7 @@ void P_LoadSegs(int lump)
 
     numsegs = W_LumpLength(lump) / sizeof(mapseg_t);
     segs = Z_Malloc(numsegs * sizeof(seg_t), PU_LEVEL, 0);
-    doom_memset(segs, 0, numsegs * sizeof(seg_t));
+    memset(segs, 0, numsegs * sizeof(seg_t));
     data = W_CacheLumpNum(lump, PU_STATIC);
 
     ml = (mapseg_t*)data;
@@ -33034,7 +33041,7 @@ void P_LoadSubsectors(int lump)
     data = W_CacheLumpNum(lump, PU_STATIC);
 
     ms = (mapsubsector_t*)data;
-    doom_memset(subsectors, 0, numsubsectors * sizeof(subsector_t));
+    memset(subsectors, 0, numsubsectors * sizeof(subsector_t));
     ss = subsectors;
 
     for (i = 0; i < numsubsectors; i++, ss++, ms++)
@@ -33059,7 +33066,7 @@ void P_LoadSectors(int lump)
 
     numsectors = W_LumpLength(lump) / sizeof(mapsector_t);
     sectors = Z_Malloc(numsectors * sizeof(sector_t), PU_LEVEL, 0);
-    doom_memset(sectors, 0, numsectors * sizeof(sector_t));
+    memset(sectors, 0, numsectors * sizeof(sector_t));
     data = W_CacheLumpNum(lump, PU_STATIC);
 
     ms = (mapsector_t*)data;
@@ -33187,7 +33194,7 @@ void P_LoadLineDefs(int lump)
 
     numlines = W_LumpLength(lump) / sizeof(maplinedef_t);
     lines = Z_Malloc(numlines * sizeof(line_t), PU_LEVEL, 0);
-    doom_memset(lines, 0, numlines * sizeof(line_t));
+    memset(lines, 0, numlines * sizeof(line_t));
     data = W_CacheLumpNum(lump, PU_STATIC);
 
     mld = (maplinedef_t*)data;
@@ -33266,7 +33273,7 @@ void P_LoadSideDefs(int lump)
 
     numsides = W_LumpLength(lump) / sizeof(mapsidedef_t);
     sides = Z_Malloc(numsides * sizeof(side_t), PU_LEVEL, 0);
-    doom_memset(sides, 0, numsides * sizeof(side_t));
+    memset(sides, 0, numsides * sizeof(side_t));
     data = W_CacheLumpNum(lump, PU_STATIC);
 
     msd = (mapsidedef_t*)data;
@@ -33308,7 +33315,7 @@ void P_LoadBlockMap(int lump)
     // clear out mobj chains
     count = sizeof(*blocklinks) * bmapwidth * bmapheight;
     blocklinks = Z_Malloc(count, PU_LEVEL, 0);
-    doom_memset(blocklinks, 0, count);
+    memset(blocklinks, 0, count);
 }
 
 
@@ -34880,7 +34887,7 @@ void P_UpdateSpecials(void)
                         break;
                 }
                 S_StartSound((mobj_t*)&buttonlist[i].soundorg, sfx_swtchn);
-                doom_memset(&buttonlist[i], 0, sizeof(button_t));
+                memset(&buttonlist[i], 0, sizeof(button_t));
             }
         }
 }
@@ -35081,7 +35088,7 @@ void P_SpawnSpecials(void)
         activeplats[i] = 0;
 
     for (i = 0; i < MAXBUTTONS; i++)
-        doom_memset(&buttonlist[i], 0, sizeof(button_t));
+        memset(&buttonlist[i], 0, sizeof(button_t));
 }
 switchlist_t alphSwitchList[] =
 {
@@ -36875,7 +36882,7 @@ void R_DrawColumnInCache(column_t* patch, byte* cache, int originy, int cachehei
             count = cacheheight - position;
 
         if (count > 0)
-            doom_memcpy(cache + position, source, count);
+            memcpy(cache + position, source, count);
 
         patch = (column_t*)((byte*)patch + patch->length + 4);
     }
@@ -36981,7 +36988,7 @@ void R_GenerateLookup(int texnum)
     // Fill in the lump / offset, so columns
     //  with only a single patch are all done.
     patchcount = (byte*)doom_malloc(texture->width);
-    doom_memset(patchcount, 0, texture->width);
+    memset(patchcount, 0, texture->width);
     patch = texture->patches;
 
     for (i = 0, patch = texture->patches;
@@ -37193,7 +37200,7 @@ void R_InitTextures(void)
         texture->height = SHORT(mtexture->height);
         texture->patchcount = SHORT(mtexture->patchcount);
 
-        doom_memcpy(texture->name, mtexture->name, sizeof(texture->name));
+        memcpy(texture->name, mtexture->name, sizeof(texture->name));
         mpatch = &mtexture->patches[0];
         patch = &texture->patches[0];
 
@@ -37344,7 +37351,7 @@ int R_FlatNumForName(char* name)
     if (i == -1)
     {
         namet[8] = 0;
-        doom_memcpy(namet, name, 8);
+        memcpy(namet, name, 8);
         //I_Error("Error: R_FlatNumForName: %s not found", namet);
         
         doom_strcpy(error_buf, "Error: R_FlatNumForName: ");
@@ -37426,7 +37433,7 @@ void R_PrecacheLevel(void)
 
     // Precache flats.
     flatpresent = doom_malloc(numflats);
-    doom_memset(flatpresent, 0, numflats);
+    memset(flatpresent, 0, numflats);
 
     for (i = 0; i < numsectors; i++)
     {
@@ -37448,7 +37455,7 @@ void R_PrecacheLevel(void)
 
     // Precache textures.
     texturepresent = doom_malloc(numtextures);
-    doom_memset(texturepresent, 0, numtextures);
+    memset(texturepresent, 0, numtextures);
 
     for (i = 0; i < numsides; i++)
     {
@@ -37483,7 +37490,7 @@ void R_PrecacheLevel(void)
 
     // Precache sprites.
     spritepresent = doom_malloc(numsprites);
-    doom_memset(spritepresent, 0, numsprites);
+    memset(spritepresent, 0, numsprites);
 
     for (th = thinkercap.next; th != &thinkercap; th = th->next)
     {
@@ -38079,13 +38086,13 @@ void R_FillBackScreen(void)
     {
         for (x = 0; x < SCREENWIDTH / 64; x++)
         {
-            doom_memcpy(dest, src + ((y & 63) << 6), 64);
+            memcpy(dest, src + ((y & 63) << 6), 64);
             dest += 64;
         }
 
         if (SCREENWIDTH & 63)
         {
-            doom_memcpy(dest, src + ((y & 63) << 6), SCREENWIDTH & 63);
+            memcpy(dest, src + ((y & 63) << 6), SCREENWIDTH & 63);
             dest += (SCREENWIDTH & 63);
         }
     }
@@ -38141,7 +38148,7 @@ void R_VideoErase(unsigned ofs, int count)
     //  is not optiomal, e.g. byte by byte on
     //  a 32bit CPU, as GNU GCC/Linux libc did
     //  at one point.
-    doom_memcpy(screens[0] + ofs, screens[1] + ofs, count);
+    memcpy(screens[0] + ofs, screens[1] + ofs, count);
 }
 
 
@@ -39085,7 +39092,7 @@ void R_ClearPlanes(void)
     lastopening = openings;
 
     // texture calculation
-    doom_memset(cachedheight, 0, sizeof(cachedheight));
+    memset(cachedheight, 0, sizeof(cachedheight));
 
     // left to right mapping
     angle = (viewangle - ANG90) >> ANGLETOFINESHIFT;
@@ -39133,7 +39140,7 @@ visplane_t* R_FindPlane(fixed_t height, int picnum, int lightlevel)
     check->minx = SCREENWIDTH;
     check->maxx = -1;
 
-    doom_memset(check->top, 0xff, sizeof(check->top));
+    memset(check->top, 0xff, sizeof(check->top));
 
     return check;
 }
@@ -39194,7 +39201,7 @@ visplane_t* R_CheckPlane(visplane_t* pl, int start, int stop)
     pl->minx = start;
     pl->maxx = stop;
 
-    doom_memset(pl->top, 0xff, sizeof(pl->top));
+    memset(pl->top, 0xff, sizeof(pl->top));
 
     return pl;
 }
@@ -40011,7 +40018,7 @@ void R_StoreWallRange(int start, int stop)
     if (((ds_p->silhouette & SIL_TOP) || maskedtexture)
         && !ds_p->sprtopclip)
     {
-        doom_memcpy(lastopening, ceilingclip + start, 2 * (rw_stopx - start));
+        memcpy(lastopening, ceilingclip + start, 2 * (rw_stopx - start));
         ds_p->sprtopclip = lastopening - start;
         lastopening += rw_stopx - start;
     }
@@ -40019,7 +40026,7 @@ void R_StoreWallRange(int start, int stop)
     if (((ds_p->silhouette & SIL_BOTTOM) || maskedtexture)
         && !ds_p->sprbottomclip)
     {
-        doom_memcpy(lastopening, floorclip + start, 2 * (rw_stopx - start));
+        memcpy(lastopening, floorclip + start, 2 * (rw_stopx - start));
         ds_p->sprbottomclip = lastopening - start;
         lastopening += rw_stopx - start;
     }
@@ -40240,7 +40247,7 @@ void R_InitSpriteDefs(char** namelist)
     for (i = 0; i < numsprites; i++)
     {
         spritename = namelist[i];
-        doom_memset(sprtemp, -1, sizeof(sprtemp));
+        memset(sprtemp, -1, sizeof(sprtemp));
 
         maxframe = -1;
         intname = *(int*)namelist[i];
@@ -40323,7 +40330,7 @@ void R_InitSpriteDefs(char** namelist)
         sprites[i].numframes = maxframe;
         sprites[i].spriteframes =
             Z_Malloc(maxframe * sizeof(spriteframe_t), PU_STATIC, 0);
-        doom_memcpy(sprites[i].spriteframes, sprtemp, maxframe * sizeof(spriteframe_t));
+        memcpy(sprites[i].spriteframes, sprtemp, maxframe * sizeof(spriteframe_t));
     }
 }
 
@@ -45614,7 +45621,7 @@ void V_CopyRect(int srcx,
 
     for (; height > 0; height--)
     {
-        doom_memcpy(dest, src, width);
+        memcpy(dest, src, width);
         src += SCREENWIDTH;
         dest += SCREENWIDTH;
     }
@@ -45849,7 +45856,7 @@ void V_DrawBlock(int x, int y, int scrn, int width, int height, byte* src)
 
     while (height--)
     {
-        doom_memcpy(dest, src, width);
+        memcpy(dest, src, width);
         src += width;
         dest += SCREENWIDTH;
     }
@@ -45879,7 +45886,7 @@ void V_GetBlock(int x, int y, int scrn, int width, int height, byte* dest)
 
     while (height--)
     {
-        doom_memcpy(dest, src, width);
+        memcpy(dest, src, width);
         src += SCREENWIDTH;
         dest += width;
     }
@@ -45935,7 +45942,7 @@ void ExtractFileBase(char* path, char* dest)
     }
 
     // copy up to eight characters
-    doom_memset(dest, 0, 8);
+    memset(dest, 0, 8);
     length = 0;
 
     while (*src && *src != '.')
@@ -46052,7 +46059,7 @@ void W_AddFile(char* filename)
     // Fill in lumpinfo
     static int previous_realloc_size = 1;
     void* new_lumpinfo = doom_malloc(numlumps * sizeof(lumpinfo_t));
-    doom_memcpy(new_lumpinfo, lumpinfo, previous_realloc_size);
+    memcpy(new_lumpinfo, lumpinfo, previous_realloc_size);
     previous_realloc_size = numlumps * sizeof(lumpinfo_t);
     lumpinfo = new_lumpinfo;
 
@@ -46168,7 +46175,7 @@ void W_InitMultipleFiles(char** filenames)
     if (!lumpcache)
         I_Error("Error: Couldn't allocate lumpcache");
 
-    doom_memset(lumpcache, 0, size);
+    memset(lumpcache, 0, size);
 }
 
 
@@ -46433,7 +46440,7 @@ void W_Profile(void)
 
     for (i = 0; i < numlumps; i++)
     {
-        doom_memcpy(name, lumpinfo[i].name, 8);
+        memcpy(name, lumpinfo[i].name, 8);
 
         for (j = 0; j < 8; j++)
             if (!name[j])
@@ -46787,7 +46794,7 @@ static int sp_state;
 
 void WI_slamBackground(void)
 {
-    doom_memcpy(screens[0], screens[1], SCREENWIDTH * SCREENHEIGHT);
+    memcpy(screens[0], screens[1], SCREENWIDTH * SCREENHEIGHT);
     V_MarkRect(0, 0, SCREENWIDTH, SCREENHEIGHT);
 }
 
