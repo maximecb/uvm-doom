@@ -7641,10 +7641,15 @@ const unsigned char* doom_get_framebuffer(int channels)
         {
             int k = i * 4;
             int kpal = screen_buffer[i] * 3;
-            final_screen_buffer[k + 0] = screen_palette[kpal + 0];
-            final_screen_buffer[k + 1] = screen_palette[kpal + 1];
-            final_screen_buffer[k + 2] = screen_palette[kpal + 2];
-            final_screen_buffer[k + 3] = 255;
+            // [UVM] Emit BGRA byte order (B at the lowest address) instead of
+            // RGBA. UVM's window_draw_frame wants BGRA, and producing it here
+            // straight from the palette lets the front-end skip a per-pixel
+            // R/B swap during upscaling. The palette (PLAYPAL) is untouched RGB
+            // source data; only the pack order below changes.
+            final_screen_buffer[k + 0] = screen_palette[kpal + 2]; // B
+            final_screen_buffer[k + 1] = screen_palette[kpal + 1]; // G
+            final_screen_buffer[k + 2] = screen_palette[kpal + 0]; // R
+            final_screen_buffer[k + 3] = 255;                      // A
         }
         return final_screen_buffer;
     }

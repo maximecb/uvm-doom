@@ -254,29 +254,23 @@ void vm_poll_input(void)
 // Video: upscale DOOM's 320x200 RGBA frame into our BGRA window buffer.
 //-----------------------------------------------------------------------------
 
-// `framebuffer` is width*height*4 bytes. DOOM's byte order is RGBA (R at the
-// lowest address); UVM's window_draw_frame wants BGRA (B at the lowest address),
-// so we swap the R and B bytes of every pixel while nearest-neighbor upscaling
-// by SCALE.
+// `framebuffer` is width*height*4 bytes, already in the BGRA byte order UVM's
+// window_draw_frame wants (doom_get_framebuffer packs it that way for us; see
+// the [UVM] note in PureDOOM.h). So no per-pixel swap is needed here -- we just
+// nearest-neighbor upscale by SCALE.
 void vm_present_frame(const unsigned char* framebuffer, int width, int height)
 {
     const uint32_t* src = (const uint32_t*)framebuffer;
 
     for (int y = 0; y < height; ++y)
     {
-        // Build the first output row for this source row: byte-swap each source
-        // pixel once and splat it SCALE times horizontally.
+        // Build the first output row for this source row: splat each source
+        // pixel SCALE times horizontally.
         uint32_t* row0 = &g_win_pixels[(y * SCALE) * WIN_WIDTH];
         const uint32_t* srow = &src[y * width];
         for (int x = 0; x < width; ++x)
         {
-            // DOOM word is 0xAABBGGRR (RGBA bytes); swap R and B to get the
-            // 0xAARRGGBB (BGRA bytes) that UVM expects.
-            uint32_t p = srow[x];
-            uint32_t c = (p & 0xFF00FF00u)
-                       | ((p & 0x000000FFu) << 16)
-                       | ((p & 0x00FF0000u) >> 16);
-
+            uint32_t c = srow[x];
             uint32_t* dst = &row0[x * SCALE];
             for (int dx = 0; dx < SCALE; ++dx)
                 dst[dx] = c;
