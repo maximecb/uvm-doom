@@ -360,8 +360,15 @@ void setup_midi(void) {}
 //       send_midi_msg((uint32_t)midi_msg);
 #endif
 
-int main(int argc, char** argv)
+int main(void)
 {
+    // uvclang's entry stub calls main with no arguments (`call main, 0`), so
+    // main must not take argc/argv — reading them traps the VM with
+    // "invalid index in get_arg, argc=0". UVM has no command line to forward to
+    // DOOM anyway, so init it with a lone program-name argument; DOOM only
+    // scans argv from index 1, so nothing past argv[0] is touched.
+    static char* doom_argv[] = { "doom" };
+
     // Bring up the window. It stays hidden until the first frame is drawn.
     g_window_id = window_create(WIN_WIDTH, WIN_HEIGHT, "PureDOOM - UVM", 0);
 
@@ -373,7 +380,7 @@ int main(int argc, char** argv)
     doom_set_gettime(vm_gettime);
 
     doom_set_resolution(WIDTH, HEIGHT);
-    doom_init(argc, argv, DOOM_FLAG_MENU_DARKEN_BG);
+    doom_init(1, doom_argv, DOOM_FLAG_MENU_DARKEN_BG);
 
     // Only now that DOOM is initialized is it safe for the audio thread to call
     // into it. Open the mono 44100Hz output, which spawns the audio callback
