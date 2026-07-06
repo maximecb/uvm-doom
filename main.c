@@ -264,23 +264,30 @@ void vm_present_frame(const unsigned char* framebuffer, int width, int height)
 
     for (int y = 0; y < height; ++y)
     {
+        // Build the first output row for this source row: byte-swap each source
+        // pixel once and splat it SCALE times horizontally.
+        uint32_t* row0 = &g_win_pixels[(y * SCALE) * WIN_WIDTH];
+        const uint32_t* srow = &src[y * width];
         for (int x = 0; x < width; ++x)
         {
             // DOOM word is 0xAABBGGRR (RGBA bytes); swap R and B to get the
             // 0xAARRGGBB (BGRA bytes) that UVM expects.
-            uint32_t p = src[y * width + x];
+            uint32_t p = srow[x];
             uint32_t c = (p & 0xFF00FF00u)
                        | ((p & 0x000000FFu) << 16)
                        | ((p & 0x00FF0000u) >> 16);
 
-            // Splat this source pixel into its SCALE x SCALE destination block.
-            for (int dy = 0; dy < SCALE; ++dy)
-            {
-                uint32_t* row = &g_win_pixels[(y * SCALE + dy) * WIN_WIDTH + x * SCALE];
-                for (int dx = 0; dx < SCALE; ++dx)
-                    row[dx] = c;
-            }
+            uint32_t* dst = &row0[x * SCALE];
+            for (int dx = 0; dx < SCALE; ++dx)
+                dst[dx] = c;
         }
+
+        // Vertical upscale: the other SCALE-1 rows are identical to row0, so
+        // copy the finished row with a native memcpy instead of recomputing and
+        // re-writing every pixel (which was SCALE-1 redundant passes).
+        for (int dy = 1; dy < SCALE; ++dy)
+            memcpy(&g_win_pixels[(y * SCALE + dy) * WIN_WIDTH],
+                   row0, WIN_WIDTH * sizeof(uint32_t));
     }
 
     // In benchmark mode there is no window; we still ran the upscale above so
