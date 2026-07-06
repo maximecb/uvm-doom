@@ -48,13 +48,13 @@
 // Id of the window we draw into (window_create returns 0 for the first window).
 static uint32_t g_window_id = 0;
 
-// Upscaled, byte-swapped frame handed to window_draw_frame each frame.
+// Upscaled BGRA frame handed to window_draw_frame each frame.
 static uint32_t g_win_pixels[WIN_HEIGHT * WIN_WIDTH];
 
 static int g_quit = 0; // Set when the user closes the window or DOOM asks to quit
 
 // Set when running a -timedemo benchmark. In this mode there is no window, so
-// vm_present_frame() still does the upscale/byte-swap work (so it's measured)
+// vm_present_frame() still does the convert/upscale work (so it's measured)
 // but skips the final window_draw_frame blit.
 static int g_benchmark = 0;
 
@@ -251,37 +251,49 @@ void vm_poll_input(void)
 }
 
 //-----------------------------------------------------------------------------
-// Video: upscale DOOM's 320x200 RGBA frame into our BGRA window buffer.
+// Video: convert + upscale DOOM's 320x200 indexed frame into our BGRA window
+// buffer in a single pass.
 //-----------------------------------------------------------------------------
 
-// `framebuffer` is width*height*4 bytes, already in the BGRA byte order UVM's
-// window_draw_frame wants (doom_get_framebuffer packs it that way for us; see
-// the [UVM] note in PureDOOM.h). So no per-pixel swap is needed here -- we just
-// nearest-neighbor upscale by SCALE.
-void vm_present_frame(const unsigned char* framebuffer, int width, int height)
+// `indexed` is width*height bytes, one 8-bit palette index per pixel (the frame
+// returned by doom_get_framebuffer(1), with the crosshair already drawn in). We
+// fold the palette->BGRA conversion into the upscale: for each source pixel we
+// look up its BGRA word once and splat it SCALE times horizontally, then copy
+// the finished row down SCALE-1 times. This drops the intermediate 320x200 BGRA
+// buffer (and its per-frame memcpy) that a separate conversion pass would need.
+void vm_present_frame(const unsigned char* indexed, int width, int height)
 {
-    const uint32_t* src = (const uint32_t*)framebuffer;
+    const uint32_t* lut = doom_get_bgra_lut();
 
     for (int y = 0; y < height; ++y)
     {
-        // Build the first output row for this source row: splat each source
-        // pixel SCALE times horizontally.
+        // Build the first output row for this source row: convert each source
+        // pixel through the LUT and splat it SCALE times horizontally.
         uint32_t* row0 = &g_win_pixels[(y * SCALE) * WIN_WIDTH];
-        const uint32_t* srow = &src[y * width];
+        const unsigned char* srow = &indexed[y * width];
+        uint32_t* dst = row0;
         for (int x = 0; x < width; ++x)
         {
-            uint32_t c = srow[x];
-            uint32_t* dst = &row0[x * SCALE];
+            uint32_t c = lut[srow[x]];
+#if SCALE == 3
+            // Unrolled horizontal splat for the fixed 3x scale (no inner loop
+            // control per pixel).
+            dst[0] = c;
+            dst[1] = c;
+            dst[2] = c;
+#else
             for (int dx = 0; dx < SCALE; ++dx)
                 dst[dx] = c;
+#endif
+            dst += SCALE;
         }
 
         // Vertical upscale: the other SCALE-1 rows are identical to row0, so
         // copy the finished row with a native memcpy instead of recomputing and
         // re-writing every pixel (which was SCALE-1 redundant passes).
         for (int dy = 1; dy < SCALE; ++dy)
-            memcpy(&g_win_pixels[(y * SCALE + dy) * WIN_WIDTH],
-                   row0, WIN_WIDTH * sizeof(uint32_t));
+            memcpy((uint8_t*)&g_win_pixels[(y * SCALE + dy) * WIN_WIDTH],
+                   (const uint8_t*)row0, WIN_WIDTH * sizeof(uint32_t));
     }
 
     // In benchmark mode there is no window; we still ran the upscale above so
@@ -479,7 +491,7 @@ int main(int argc, char** argv)
             // so the demo plays back flat-out. When the demo ends DOOM sets
             // g_quit (via I_Error/our exit override), breaking the loop.
             //
-            // We still call vm_present_frame() so the upscale / byte-swap path
+            // We still call vm_present_frame() so the convert / upscale path
             // is exercised and counted, but with no window it skips the final
             // blit (see vm_present_frame). We deliberately do NOT poll input:
             // vm_poll_input() would feed window events to DOOM, and any input
@@ -488,7 +500,7 @@ int main(int argc, char** argv)
             // exit -- so it would "start over" forever rather than reporting a
             // result.
             doom_force_update();
-            vm_present_frame(doom_get_framebuffer(4), WIDTH, HEIGHT);
+            vm_present_frame(doom_get_framebuffer(1), WIDTH, HEIGHT);
             bench_frames++;
             continue;
         }
@@ -503,7 +515,7 @@ int main(int argc, char** argv)
         doom_update();
         pthread_mutex_unlock(&g_doom_lock);
 
-        vm_present_frame(doom_get_framebuffer(4), WIDTH, HEIGHT);
+        vm_present_frame(doom_get_framebuffer(1), WIDTH, HEIGHT);
 
         // Cap to ~60 FPS in normal play.
         uint64_t elapsed = time_current_ms() - start;

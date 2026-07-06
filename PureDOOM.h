@@ -195,6 +195,12 @@ void doom_force_update(); // This will run a frame everytime it's called, regard
 // Channels: 1 = indexed, 3 = RGB, 4 = RGBA
 const unsigned char* doom_get_framebuffer(int channels);
 
+// [UVM] Returns the 256-entry palette->BGRA lookup table (rebuilt in
+// I_SetPalette whenever the palette changes). Lets the front-end fold the
+// palette->BGRA conversion into its upscale pass: one 32-bit store per source
+// pixel straight from the indexed framebuffer (doom_get_framebuffer(1)).
+const uint32_t* doom_get_bgra_lut(void);
+
 // It is always 2048 bytes in size
 short* doom_get_sound_buffer();
 
@@ -7012,6 +7018,13 @@ extern signed short mixbuffer[2048];
 
 static unsigned char* screen_buffer = 0;
 static unsigned char* final_screen_buffer = 0;
+
+// [UVM] Palette->BGRA lookup table, rebuilt whenever the palette changes (see
+// I_SetPalette). Each entry is a full BGRA pixel packed little-endian (B at the
+// lowest address, A in the high byte) so a single 32-bit store emits it. The
+// palette only changes on damage/item/powerup flashes, so the rebuild is rare
+// relative to the per-pixel drawing this replaces.
+static uint32_t bgra_lut[256];
 static int last_update_time = 0;
 static int button_states[3] = { 0 };
 static char itoa_buf[20];
@@ -7637,26 +7650,25 @@ const unsigned char* doom_get_framebuffer(int channels)
     }
     else if (channels == 4)
     {
+        // [UVM] Emit BGRA (the order UVM's window_draw_frame wants) via the
+        // precomputed lookup table: one 32-bit store per pixel instead of 3
+        // palette reads + 4 byte writes. The LUT already packs B at the lowest
+        // address and A in the high byte (see bgra_lut / I_SetPalette).
+        uint32_t* dst32 = (uint32_t*)final_screen_buffer;
         for (i = 0, len = SCREENWIDTH * SCREENHEIGHT; i < len; ++i)
-        {
-            int k = i * 4;
-            int kpal = screen_buffer[i] * 3;
-            // [UVM] Emit BGRA byte order (B at the lowest address) instead of
-            // RGBA. UVM's window_draw_frame wants BGRA, and producing it here
-            // straight from the palette lets the front-end skip a per-pixel
-            // R/B swap during upscaling. The palette (PLAYPAL) is untouched RGB
-            // source data; only the pack order below changes.
-            final_screen_buffer[k + 0] = screen_palette[kpal + 2]; // B
-            final_screen_buffer[k + 1] = screen_palette[kpal + 1]; // G
-            final_screen_buffer[k + 2] = screen_palette[kpal + 0]; // R
-            final_screen_buffer[k + 3] = 255;                      // A
-        }
+            dst32[i] = bgra_lut[screen_buffer[i]];
         return final_screen_buffer;
     }
     else
     {
         return 0;
     }
+}
+
+
+const uint32_t* doom_get_bgra_lut(void)
+{
+    return bgra_lut;
 }
 
 
@@ -16472,6 +16484,20 @@ void I_ReadScreen(byte* scr)
 void I_SetPalette(byte* palette)
 {
     doom_memcpy(screen_palette, palette, 256 * 3);
+
+    // [UVM] Rebuild the palette->BGRA lookup table consumed by
+    // doom_get_framebuffer and the front-end upscaler. PLAYPAL is RGB source
+    // data; we pack it little-endian as B|G<<8|R<<16|A<<24 so that storing an
+    // entry as a 32-bit word lays the bytes out B,G,R,A in memory (BGRA), the
+    // order UVM's window_draw_frame expects.
+    for (int c = 0; c < 256; ++c)
+    {
+        int p = c * 3;
+        bgra_lut[c] = ((uint32_t)screen_palette[p + 2])         // B (low byte)
+                    | ((uint32_t)screen_palette[p + 1] << 8)    // G
+                    | ((uint32_t)screen_palette[p + 0] << 16)   // R
+                    | ((uint32_t)255u << 24);                   // A (high byte)
+    }
 }
 
 

@@ -21,12 +21,18 @@ If you already cloned without it, pull the submodule in:
 git submodule update --init --recursive
 ```
 
-To later update UVM to its latest upstream commit:
+## Building and running
 
 ```bash
-git submodule update --remote uvm
-git add uvm && git commit -m "Bump uvm submodule"
+./build_and_run.sh
 ```
+
+This compiles `main.c` to `out.asm` with uvclang and runs it on the UVM VM.
+Any extra arguments are forwarded to Doom. `out.asm` is cached; delete it to
+force a rebuild.
+
+> Note: UVM's clang backend is sensitive to the LLVM IR it receives from clang.
+> If the build fails, you may need to upgrade your version of clang.
 
 ## License
 
