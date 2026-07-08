@@ -31,7 +31,7 @@
 // Final output scale for the voice mix (i16 units per 1.0 of mix amplitude).
 // Tuned so a typical DOOM track peaks well below clipping while staying
 // audible against the SFX mix.
-#define SYNTH_MASTER 50000.0f
+#define SYNTH_MASTER 40000.0f
 
 // Oscillator waveforms
 enum
