@@ -7,8 +7,8 @@
 #
 # Steps:
 #   1. Fetch the uvm git submodule if it isn't checked out yet.
-#   2. Compile main.c -> out.asm at -O2 (skipped if out.asm already exists;
-#      delete out.asm to force a rebuild).
+#   2. Compile main.c -> out.asm at -O2 (always rebuilt so source changes and
+#      the current uvclang/clang toolchain are picked up).
 #   3. Run the result on the UVM VM, built in release mode.
 set -e
 
@@ -24,13 +24,10 @@ if [ ! -f uvm/uvclang/Cargo.toml ]; then
     git submodule update --init --recursive
 fi
 
-# 2. Compile main.c -> out.asm at -O2, unless it's already built.
-if [ -f out.asm ]; then
-    echo "out.asm already built; skipping compile (delete it to rebuild)."
-else
-    echo "Compiling main.c -> out.asm (-O2)..."
-    cargo run --release --manifest-path uvm/uvclang/Cargo.toml -- -O2 main.c -o out.asm
-fi
+# 2. Compile main.c -> out.asm at -O2 (always, so source and toolchain changes
+#    are reflected).
+echo "Compiling main.c -> out.asm (-O2)..."
+cargo run --release --manifest-path uvm/uvclang/Cargo.toml -- -O2 main.c -o out.asm
 
 # 3. Run UVM DOOM on the VM (release build).
 echo "Launching UVM DOOM..."
