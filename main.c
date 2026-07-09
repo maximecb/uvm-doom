@@ -323,6 +323,18 @@ void vm_present_frame(const unsigned char* indexed, int width, int height)
 #define MIDI_PUMP_FRAMES (44100 / DOOM_MIDI_RATE)
 static int g_midi_countdown = 0;
 
+// Scratch schedule of MIDI events for one audio callback: message + the sample
+// offset within the block where it should be applied. We drain DOOM's music
+// stream into this array up front (each doom_tick_midi() briefly takes DOOM's
+// internal g_music_lock), then do the synth work (applying events + rendering)
+// entirely lock-free — see the music section of audio_cb(). Sized for the worst
+// realistic burst: a song change drains the whole async queue
+// (MAX_QUEUED_MIDI_MSGS == 256) plus a clutch of simultaneous note events, so
+// give it generous headroom.
+#define MAX_BLOCK_MIDI 512
+static uint32_t g_block_midi_msg[MAX_BLOCK_MIDI];
+static int g_block_midi_off[MAX_BLOCK_MIDI];
+
 //-----------------------------------------------------------------------------
 // Audio: bridge DOOM's 11025Hz stereo mix to UVM's 44100Hz stereo output.
 //
@@ -338,9 +350,12 @@ static int g_midi_countdown = 0;
 #define UPSAMPLE 4                    // 44100 / 11025
 #define MIX_FRAMES (DOOM_FRAMES * UPSAMPLE) // 2048 stereo frames @ 44100Hz
 
-// doom_get_sound_buffer() and doom_update() both touch DOOM's sound state, and
-// the audio callback runs on its own UVM thread, so serialize them with a lock.
-static pthread_mutex_t g_doom_lock = PTHREAD_MUTEX_INITIALIZER;
+// Cross-thread synchronization between this audio callback thread and the game
+// thread lives *inside* DOOM's sound layer now (PureDOOM.h's g_sfx_lock guards
+// the SFX mixer, g_music_lock guards the MUS/MIDI sequencer). Each guards only
+// its small shared data, so neither is held across doom_update()'s render. The
+// callback therefore takes no lock of its own — it just calls into DOOM's sound
+// functions, which lock briefly as needed.
 
 // Set once doom_init() has run, so the audio thread never touches DOOM state
 // before it exists.
@@ -363,6 +378,17 @@ int16_t* audio_cb(uint64_t num_channels, uint64_t num_samples)
         return g_out;
     }
 
+    // Budget check: a 1024-frame block at 44100Hz is ~23.2ms of audio, so the
+    // whole callback must finish well under that or the audio thread underruns
+    // and the output glitches. Time the full callback, and separately tally the
+    // time spent inside DOOM's sound/music calls (doom_get_sound_buffer and
+    // doom_tick_midi) — the only places the callback can now block on the game
+    // thread, since that's where DOOM's g_sfx_lock / g_music_lock live. That
+    // split tells us whether an over-budget block was lost to cross-thread
+    // contention or to our own synth/SFX compute.
+    uint64_t cb_start_ms = time_current_ms();
+    uint64_t doom_ms = 0;
+
     for (uint64_t i = 0; i < num_samples; ++i)
     {
         if (g_mix_pos >= MIX_FRAMES)
@@ -373,8 +399,10 @@ int16_t* audio_cb(uint64_t num_channels, uint64_t num_samples)
             // scale in I_StartSound (see the [UVM] note there); on top of
             // that, boost 2x with saturation so SFX sit clearly above the
             // music synth (point-blank blasts will clip a little; fine).
-            pthread_mutex_lock(&g_doom_lock);
+            // doom_get_sound_buffer() runs the SFX mixer under g_sfx_lock.
+            uint64_t doom_t0 = time_current_ms();
             int16_t* db = doom_get_sound_buffer();
+            doom_ms += time_current_ms() - doom_t0;
             for (int f = 0; f < DOOM_FRAMES; ++f)
             {
                 int32_t l = 2 * (int32_t)db[2 * f];
@@ -388,7 +416,6 @@ int16_t* audio_cb(uint64_t num_channels, uint64_t num_samples)
                     g_mix[m + 1] = (int16_t)r;
                 }
             }
-            pthread_mutex_unlock(&g_doom_lock);
             g_mix_pos = 0;
         }
 
@@ -397,44 +424,78 @@ int16_t* audio_cb(uint64_t num_channels, uint64_t num_samples)
         ++g_mix_pos;
     }
 
-    // Music: drain DOOM's MIDI stream into the synth at 140Hz and render the
-    // synth on top of the SFX, in sub-blocks so the MIDI pumps land on their
-    // exact sample positions within this callback block.
+    // Music: drain DOOM's MIDI stream and render the synth on top of the SFX.
     //
-    // Budget check: a 1024-frame block at 44100Hz is ~23.2ms of audio, so the
-    // whole synth pass for this callback must finish well under that or the
-    // audio thread underruns and the output glitches. Time the pass and warn
-    // if it blows the budget.
-    uint64_t synth_start_ms = time_current_ms();
+    // Only doom_tick_midi() touches DOOM's music state (the game thread mutates
+    // it on song changes / volume); it takes DOOM's g_music_lock internally per
+    // call. synth_midi() and synth_render() touch only synth state, which lives
+    // entirely on this audio thread. So we first drain the raw MIDI messages for
+    // the whole block — tagging each with the sample offset where it lands
+    // (140Hz pumps, MIDI_PUMP_FRAMES apart) — then apply them and render, all
+    // lock-free. The render never blocks on the game thread's doom_update().
+    int nev = 0;
+    uint64_t doom_t1 = time_current_ms();
+    {
+        uint64_t p = 0;
+        int countdown = g_midi_countdown;
+        while (p < num_samples)
+        {
+            if (countdown <= 0)
+            {
+                unsigned long midi_msg;
+                while ((midi_msg = doom_tick_midi()) != 0)
+                {
+                    if (nev < MAX_BLOCK_MIDI)
+                    {
+                        g_block_midi_msg[nev] = (uint32_t)midi_msg;
+                        g_block_midi_off[nev] = (int)p;
+                        nev++;
+                    }
+                    else
+                    {
+                        // Overflow (pathological burst): apply immediately rather
+                        // than drop it, so no note gets stuck.
+                        synth_midi((uint32_t)midi_msg);
+                    }
+                }
+                countdown = MIDI_PUMP_FRAMES;
+            }
+
+            uint64_t n = num_samples - p;
+            if (n > (uint64_t)countdown)
+                n = (uint64_t)countdown;
+            countdown -= (int)n;
+            p += n;
+        }
+        g_midi_countdown = countdown;
+    }
+    doom_ms += time_current_ms() - doom_t1;
+
+    // Apply the scheduled events and render the synth, all lock-free.
     uint64_t pos = 0;
+    int ev = 0;
     while (pos < num_samples)
     {
-        if (g_midi_countdown <= 0)
-        {
-            // doom_tick_midi() touches DOOM's music state, which the game
-            // thread also mutates (song changes, volume) — take the lock.
-            pthread_mutex_lock(&g_doom_lock);
-            unsigned long midi_msg;
-            while ((midi_msg = doom_tick_midi()) != 0)
-                synth_midi((uint32_t)midi_msg);
-            pthread_mutex_unlock(&g_doom_lock);
-            g_midi_countdown = MIDI_PUMP_FRAMES;
-        }
+        // Apply every event scheduled at or before this sample offset.
+        while (ev < nev && (uint64_t)g_block_midi_off[ev] <= pos)
+            synth_midi(g_block_midi_msg[ev++]);
 
-        uint64_t n = num_samples - pos;
-        if (n > (uint64_t)g_midi_countdown)
-            n = (uint64_t)g_midi_countdown;
-        synth_render(g_out + 2 * pos, (int)n);
-        g_midi_countdown -= (int)n;
-        pos += n;
+        // Render up to the next event (or the end of the block).
+        uint64_t next = num_samples;
+        if (ev < nev && (uint64_t)g_block_midi_off[ev] < next)
+            next = (uint64_t)g_block_midi_off[ev];
+        synth_render(g_out + 2 * pos, (int)(next - pos));
+        pos = next;
     }
 
-    uint64_t synth_ms = time_current_ms() - synth_start_ms;
-    if (synth_ms > 23)
+    uint64_t cb_ms = time_current_ms() - cb_start_ms;
+    if (cb_ms > 23)
     {
-        print_str("[uvm-doom] WARNING: MIDI music synth render took ");
-        print_str(doom_itoa((int)synth_ms, 10));
-        print_str("ms for ");
+        print_str("[uvm-doom] WARNING: audio callback took ");
+        print_str(doom_itoa((int)cb_ms, 10));
+        print_str("ms (");
+        print_str(doom_itoa((int)doom_ms, 10));
+        print_str("ms in DOOM sound/music calls) for ");
         print_str(doom_itoa((int)num_samples, 10));
         print_str(" frames (budget ~23ms)\n");
     }
@@ -571,11 +632,13 @@ int main(int argc, char** argv)
 
         vm_poll_input();
 
-        // The audio thread also calls into DOOM's sound code; hold the lock
-        // around doom_update() so the two never run concurrently.
-        pthread_mutex_lock(&g_doom_lock);
+        // No coarse lock here anymore: doom_update() starts SFX and changes
+        // music deep in the game tic, but those mutations now take DOOM's
+        // fine-grained g_sfx_lock / g_music_lock only for the brief moments they
+        // touch shared sound state (see PureDOOM.h). The bulk of doom_update()
+        // — the software renderer — touches no sound state and so no longer
+        // blocks the audio callback.
         doom_update();
-        pthread_mutex_unlock(&g_doom_lock);
 
         vm_present_frame(doom_get_framebuffer(1), WIDTH, HEIGHT);
 

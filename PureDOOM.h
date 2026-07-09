@@ -15260,6 +15260,25 @@ unsigned long queued_midi_msgs[MAX_QUEUED_MIDI_MSGS];
 int queue_midi_head = 0;
 int queue_midi_tail = 0;
 
+// [UVM] Fine-grained locks that decouple the audio-callback thread from the
+// game thread. The audio thread renders SFX (I_UpdateSound) and ticks the music
+// sequencer (I_TickSong); the game thread mutates that same state deep inside
+// doom_update() (addsfx / I_RegisterSong / I_PlaySong / I_SetMusicVolume ...).
+// Rather than serialize the whole of doom_update() against the audio callback --
+// which would stall the callback for the entire software-render frame, since
+// doom_update() holds the lock across rendering that touches no sound state --
+// we guard only the two small independent shared-data domains:
+//   g_sfx_lock   : the SFX mixer channels[] arrays + mixbuffer
+//                  (writers: addsfx; consumer: I_UpdateSound)
+//   g_music_lock : the MUS/MIDI sequencer state (mus_*, queued_midi_msgs)
+//                  (writers: I_RegisterSong/I_*Song/I_SetMusicVolume;
+//                   consumer: I_TickSong)
+// No guarded function calls another guarded one, and none needs both locks, so
+// there is no nesting or lock-ordering hazard.
+#include <pthread.h>
+static pthread_mutex_t g_sfx_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_music_lock = PTHREAD_MUTEX_INITIALIZER;
+
 
 void TickSong();
 
@@ -15339,6 +15358,10 @@ void* getsfx(char* sfxname, int* len)
 int addsfx(int sfxid, int volume, int step, int seperation)
 {
     static unsigned short handlenums = 0;
+
+    // [UVM] Writes the shared mixer channel arrays; the audio thread walks them
+    // in I_UpdateSound. See g_sfx_lock.
+    pthread_mutex_lock(&g_sfx_lock);
 
     int i;
     int rc = -1;
@@ -15447,6 +15470,7 @@ int addsfx(int sfxid, int volume, int step, int seperation)
     channelids[slot] = sfxid;
 
     // You tell me.
+    pthread_mutex_unlock(&g_sfx_lock);
     return rc;
 }
 
@@ -15770,6 +15794,7 @@ void I_SetSfxVolume(int volume)
 // MUSIC API - dummy. Some code from DOS version.
 void I_SetMusicVolume(int volume)
 {
+    pthread_mutex_lock(&g_music_lock); // [UVM] enqueues to the MIDI queue I_TickSong drains
     snd_MusicVolume = volume;
     mus_volume = snd_MusicVolume * 8;
 
@@ -15777,6 +15802,7 @@ void I_SetMusicVolume(int volume)
     {
         queued_midi_msgs[(queue_midi_tail++) % MAX_QUEUED_MIDI_MSGS] = (0x000000B0 | i | 0x0700 | (((mus_channel_volumes[i] * mus_volume) / 127) << 16));
     }
+    pthread_mutex_unlock(&g_music_lock);
 }
 
 
@@ -15855,6 +15881,10 @@ int I_SoundIsPlaying(int handle)
 void I_UpdateSound(void)
 {
     static int song_tick_progress = 0;
+
+    // [UVM] Reads/advances the shared mixer channel arrays that addsfx writes on
+    // the game thread. See g_sfx_lock.
+    pthread_mutex_lock(&g_sfx_lock);
 
     // Mix current sound data.
     // Data, from raw sound, for right and left.
@@ -15954,6 +15984,8 @@ void I_UpdateSound(void)
         leftout += step;
         rightout += step;
     }
+
+    pthread_mutex_unlock(&g_sfx_lock);
 }
 
 
@@ -16057,22 +16089,28 @@ void I_ShutdownMusic(void)
 
 void I_PlaySong(int handle, int looping)
 {
+    pthread_mutex_lock(&g_music_lock); // [UVM] mutates sequencer state I_TickSong reads
     musicdies = gametic + TICRATE * 30;
 
     mus_loop = looping ? true : false;
     mus_playing = true;
+    pthread_mutex_unlock(&g_music_lock);
 }
 
 
 void I_PauseSong(int handle)
 {
+    pthread_mutex_lock(&g_music_lock);
     mus_playing = false;
+    pthread_mutex_unlock(&g_music_lock);
 }
 
 
 void I_ResumeSong(int handle)
 {
+    pthread_mutex_lock(&g_music_lock);
     if (mus_data) mus_playing = true;
+    pthread_mutex_unlock(&g_music_lock);
 }
 
 
@@ -16085,12 +16123,17 @@ static void reset_all_channels()
 
 void I_StopSong(int handle)
 {
+    // [UVM] Mutates sequencer state + enqueues all-notes-off; guard against
+    // I_TickSong on the audio thread. reset_all_channels only touches the MIDI
+    // queue and is called nowhere else, so it stays lock-free (no nesting).
+    pthread_mutex_lock(&g_music_lock);
     mus_data = 0;
     mus_delay = 0;
     mus_offset = 0;
     mus_playing = false;
 
     reset_all_channels();
+    pthread_mutex_unlock(&g_music_lock);
 }
 
 
@@ -16102,14 +16145,22 @@ void I_UnRegisterSong(int handle)
 
 int I_RegisterSong(void* data)
 {
+    // [UVM] Installs a new song (mus_data/header/offset); guard against
+    // I_TickSong on the audio thread.
+    pthread_mutex_lock(&g_music_lock);
     memcpy(&mus_header, data, sizeof(mus_header_t));
-    if (doom_strncmp(mus_header.ID, "MUS", 3) != 0 || mus_header.ID[3] != 0x1A) return 0;
+    if (doom_strncmp(mus_header.ID, "MUS", 3) != 0 || mus_header.ID[3] != 0x1A)
+    {
+        pthread_mutex_unlock(&g_music_lock);
+        return 0;
+    }
 
     mus_data = (unsigned char*)data;
     mus_delay = 0;
     mus_offset = mus_header.scoreStart;
     mus_playing = false;
 
+    pthread_mutex_unlock(&g_music_lock);
     return 1;
 }
 
@@ -16121,7 +16172,12 @@ int I_QrySongPlaying(int handle)
 }
 
 
-unsigned long I_TickSong()
+// [UVM] Inner body of the music tick. Runs on the audio thread and reads/
+// advances the whole MUS/MIDI sequencer state (queue, mus_*); the game thread
+// mutates the same state via I_RegisterSong/I_*Song/I_SetMusicVolume. It has
+// many early returns, so the g_music_lock is taken once in the I_TickSong
+// wrapper below rather than threaded through every return.
+static unsigned long I_TickSong_locked()
 {
     unsigned long midi_event = 0;
 
@@ -16272,6 +16328,14 @@ unsigned long I_TickSong()
 
     mus_delay--;
 
+    return midi_event;
+}
+
+unsigned long I_TickSong()
+{
+    pthread_mutex_lock(&g_music_lock);
+    unsigned long midi_event = I_TickSong_locked();
+    pthread_mutex_unlock(&g_music_lock);
     return midi_event;
 }
 int mb_used = 6 * (sizeof(void*) / 4);

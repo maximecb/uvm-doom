@@ -3,3 +3,5 @@ doomsav*.dsg
 
 # Build output
 *.asm
+
+TODO.txt
