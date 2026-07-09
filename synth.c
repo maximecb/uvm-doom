@@ -31,7 +31,7 @@
 // Final output scale for the voice mix (i16 units per 1.0 of mix amplitude).
 // Tuned so a typical DOOM track peaks well below clipping while staying
 // audible against the SFX mix.
-#define SYNTH_MASTER 40000.0f
+#define SYNTH_MASTER 30000.0f
 
 // Oscillator waveforms
 enum
@@ -245,10 +245,10 @@ static void gm_patch(int prog, Patch* p)
             p->decay = 1.2f;
             p->sustain = 0.7f;
             p->release = 0.15f;
-            p->cutoff = 3000.0f;
-            p->gain = 0.9f;
+            p->cutoff = 2400.0f;
+            p->gain = 1.2f;
             p->detune = 1.009f;
-            p->drive = 14.0f;
+            p->drive = 1.0f;
             p->sub = 0.6f;
             break;
         case 31: // Guitar harmonics: brighter, lighter overdrive
