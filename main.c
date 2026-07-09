@@ -400,6 +400,12 @@ int16_t* audio_cb(uint64_t num_channels, uint64_t num_samples)
     // Music: drain DOOM's MIDI stream into the synth at 140Hz and render the
     // synth on top of the SFX, in sub-blocks so the MIDI pumps land on their
     // exact sample positions within this callback block.
+    //
+    // Budget check: a 1024-frame block at 44100Hz is ~23.2ms of audio, so the
+    // whole synth pass for this callback must finish well under that or the
+    // audio thread underruns and the output glitches. Time the pass and warn
+    // if it blows the budget.
+    uint64_t synth_start_ms = time_current_ms();
     uint64_t pos = 0;
     while (pos < num_samples)
     {
@@ -421,6 +427,16 @@ int16_t* audio_cb(uint64_t num_channels, uint64_t num_samples)
         synth_render(g_out + 2 * pos, (int)n);
         g_midi_countdown -= (int)n;
         pos += n;
+    }
+
+    uint64_t synth_ms = time_current_ms() - synth_start_ms;
+    if (synth_ms > 23)
+    {
+        print_str("[uvm-doom] WARNING: MIDI music synth render took ");
+        print_str(doom_itoa((int)synth_ms, 10));
+        print_str("ms for ");
+        print_str(doom_itoa((int)num_samples, 10));
+        print_str(" frames (budget ~23ms)\n");
     }
 
     return g_out;
