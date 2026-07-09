@@ -8,30 +8,18 @@ run smoothly on UVM, and a simple MIDI synth so we can enjoy Doom's badass sound
   <img src="uvm_doom.jpg" width="700" />
 </p>
 
-## Getting the code
+## Building and running
 
 This repo uses [UVM](https://github.com/maximecb/uvm) as a git submodule (in
-`uvm/`), so clone with `--recurse-submodules`:
-
-```bash
-git clone --recurse-submodules https://github.com/maximecb/uvm-doom.git
-```
-
-If you already cloned without it, pull the submodule in:
-
-```bash
-git submodule update --init --recursive
-```
-
-## Building and running
+`uvm/`). There is a convenient build script that fetches the submodule,
+compiles Doom, and then launches it:
 
 ```bash
 ./build_and_run.sh
 ```
 
 This compiles `main.c` to `out.asm` with uvclang and runs it on the UVM VM.
-Any extra arguments are forwarded to Doom. `out.asm` is cached; delete it to
-force a rebuild.
+Any extra arguments are forwarded to Doom.
 
 > Note: UVM's clang backend is sensitive to the LLVM IR it receives from clang.
 > If the build fails, you may need to upgrade your version of clang.
